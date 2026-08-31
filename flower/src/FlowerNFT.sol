@@ -30,6 +30,8 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     uint256 private _nextTokenId = 1;
 
     bool public saleActive;
+    bool public reserveMintingFinalized;
+    bool public metadataFrozen;
     string private _baseTokenUri;
     IActivationTransferHook public activationHook;
 
@@ -38,11 +40,16 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     error InvalidMintPrice();
     error PublicSupplyExceeded();
     error ReservedSupplyExceeded();
+    error ReserveAlreadyFinalized();
+    error ReserveNotFinalized();
+    error MetadataIsFrozen();
     error ActivationHookAlreadySet();
     error ZeroAddress();
 
     event SaleActiveSet(bool active);
     event BaseURISet(string newBaseURI);
+    event MetadataFrozen(string finalBaseURI);
+    event ReserveMintingFinalized(uint256 finalReservedSupply);
     event ActivationHookSet(address indexed hook);
     event PublicMint(address indexed buyer, uint256 quantity, uint256 cost, uint256 firstTokenId);
     event ReserveMint(address indexed to, uint256 quantity, uint256 firstTokenId);
@@ -83,8 +90,9 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
 
     /// @notice Mints from the single 2,222-NFT non-public pool.
     /// @dev The deployment/treasury process decides how this pool is split between
-    ///      team and protocol reserve; that unsettled split is not hard-coded here.
-    function reserveMint(address to, uint256 quantity) external onlyOwner nonReentrant {
+    ///      team and protocol reserve. The pool must be finalized before public sale begins.
+    function reserveMint(address to, uint256 quantity) external nonReentrant onlyOwner {
+        if (reserveMintingFinalized) revert ReserveAlreadyFinalized();
         if (to == address(0)) revert ZeroAddress();
         if (quantity == 0 || reservedMinted + quantity > RESERVED_SUPPLY) {
             revert ReservedSupplyExceeded();
@@ -99,14 +107,32 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
         }
     }
 
+    /// @notice Permanently closes the non-public mint allocation.
+    /// @dev Public sale cannot be activated until this is called, making the final
+    ///      reserved supply visible and immutable before buyers enter.
+    function finalizeReserveMinting() external onlyOwner {
+        if (reserveMintingFinalized) revert ReserveAlreadyFinalized();
+        reserveMintingFinalized = true;
+        emit ReserveMintingFinalized(reservedMinted);
+    }
+
     function setSaleActive(bool active) external onlyOwner {
+        if (active && !reserveMintingFinalized) revert ReserveNotFinalized();
         saleActive = active;
         emit SaleActiveSet(active);
     }
 
     function setBaseURI(string calldata newBaseURI) external onlyOwner {
+        if (metadataFrozen) revert MetadataIsFrozen();
         _baseTokenUri = newBaseURI;
         emit BaseURISet(newBaseURI);
+    }
+
+    /// @notice Permanently freezes metadata URI mutation.
+    function freezeMetadata() external onlyOwner {
+        if (metadataFrozen) revert MetadataIsFrozen();
+        metadataFrozen = true;
+        emit MetadataFrozen(_baseTokenUri);
     }
 
     /// @notice One-time installation of the activation transfer hook.
