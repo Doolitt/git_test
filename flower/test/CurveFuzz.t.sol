@@ -12,6 +12,11 @@ contract CurveFuzzTest is Test {
     uint256 internal constant FLOOR = 50_000_000 ether;
     uint256 internal constant MAX_TEST_LOCK = 100_000_000_000 ether;
     uint256 internal constant MAX_TEST_BURN = 10_000_000_000 ether;
+    uint256 internal constant LOCK_500M = 500_000_000 ether;
+    uint16 internal constant DAYS_90 = 90;
+    uint16 internal constant DAYS_180 = 180;
+    uint16 internal constant DAYS_365 = 365;
+    uint16 internal constant DAYS_730 = 730;
 
     ActivationManager internal manager;
 
@@ -26,8 +31,8 @@ contract CurveFuzzTest is Test {
         uint256 b = bound(uint256(seedB), FLOOR, MAX_TEST_LOCK);
         if (a > b) (a, b) = (b, a);
 
-        uint256 weightA = manager.computeWeight(a, 0, 365);
-        uint256 weightB = manager.computeWeight(b, 0, 365);
+        uint256 weightA = manager.computeWeight(a, 0, DAYS_365);
+        uint256 weightB = manager.computeWeight(b, 0, DAYS_365);
         assertLe(weightA, weightB);
     }
 
@@ -36,8 +41,8 @@ contract CurveFuzzTest is Test {
         uint256 b = bound(uint256(seedB), 0, MAX_TEST_BURN);
         if (a > b) (a, b) = (b, a);
 
-        uint256 weightA = manager.computeWeight(500_000_000 ether, a, 365);
-        uint256 weightB = manager.computeWeight(500_000_000 ether, b, 365);
+        uint256 weightA = manager.computeWeight(LOCK_500M, a, DAYS_365);
+        uint256 weightB = manager.computeWeight(LOCK_500M, b, DAYS_365);
         assertLe(weightA, weightB);
     }
 
@@ -45,10 +50,10 @@ contract CurveFuzzTest is Test {
         uint256 lockAmount = bound(uint256(lockSeed), FLOOR + 1_000_000 ether, MAX_TEST_LOCK);
         uint256 burnAmount = bound(uint256(burnSeed), 0, MAX_TEST_BURN);
 
-        uint256 w90 = manager.computeWeight(lockAmount, burnAmount, 90);
-        uint256 w180 = manager.computeWeight(lockAmount, burnAmount, 180);
-        uint256 w365 = manager.computeWeight(lockAmount, burnAmount, 365);
-        uint256 w730 = manager.computeWeight(lockAmount, burnAmount, 730);
+        uint256 w90 = manager.computeWeight(lockAmount, burnAmount, DAYS_90);
+        uint256 w180 = manager.computeWeight(lockAmount, burnAmount, DAYS_180);
+        uint256 w365 = manager.computeWeight(lockAmount, burnAmount, DAYS_365);
+        uint256 w730 = manager.computeWeight(lockAmount, burnAmount, DAYS_730);
 
         assertLe(w90, w180);
         assertLe(w180, w365);
@@ -59,6 +64,6 @@ contract CurveFuzzTest is Test {
         uint256 lockAmount = bound(uint256(lockSeed), FLOOR, MAX_TEST_LOCK);
         uint256 burnAmount = bound(uint256(burnSeed), 0, MAX_TEST_BURN);
 
-        assertGe(manager.computeWeight(lockAmount, burnAmount, 90), manager.BASE_WEIGHT());
+        assertGe(manager.computeWeight(lockAmount, burnAmount, DAYS_90), manager.BASE_WEIGHT());
     }
 }
