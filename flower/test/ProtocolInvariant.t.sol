@@ -123,9 +123,8 @@ contract ProtocolInvariantTest is StdInvariant, Test {
         flower = new FLOWER(address(this));
         nft = new FlowerNFT(address(this), IERC20(address(quote)), address(0x7777), 250 ether, "ipfs://");
         manager = new ActivationManager(address(this), nft, IFLOWER(address(flower)));
-        RewardDistributor distributor = new RewardDistributor(
-            IERC20(address(quote)), nft, IWeightProvider(address(manager)), address(manager)
-        );
+        RewardDistributor distributor =
+            new RewardDistributor(IERC20(address(quote)), nft, IWeightProvider(address(manager)), address(manager));
         handler = new InvariantHandler(flower, nft, manager);
 
         nft.setActivationHook(IActivationTransferHook(address(manager)));
@@ -140,6 +139,7 @@ contract ProtocolInvariantTest is StdInvariant, Test {
         selectors[1] = handler.increaseLock.selector;
         selectors[2] = handler.burnForDevelopment.selector;
         selectors[3] = handler.extendDuration.selector;
+        targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -179,10 +179,7 @@ contract ProtocolInvariantTest is StdInvariant, Test {
             } else {
                 assertEq(activator, address(handler));
                 assertGe(uint256(locked), manager.ACTIVATION_FLOOR());
-                assertEq(
-                    weight,
-                    manager.computeWeight(uint256(locked), manager.permanentBurned(tokenId), durationDays)
-                );
+                assertEq(weight, manager.computeWeight(uint256(locked), manager.permanentBurned(tokenId), durationDays));
             }
         }
     }
