@@ -6,10 +6,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {FLOWER} from "../src/FLOWER.sol";
 import {FlowerNFT} from "../src/FlowerNFT.sol";
-import {ActivationManager, IFLOWER} from "../src/ActivationManager.sol";
+import {ActivationManager} from "../src/ActivationManager.sol";
 import {RewardDistributor} from "../src/RewardDistributor.sol";
-import {IActivationTransferHook} from "../src/interfaces/IActivationTransferHook.sol";
-import {IRewardDistributor} from "../src/interfaces/IRewardDistributor.sol";
+import {IFLOWER} from "../src/interfaces/IFLOWER.sol";
 import {IWeightProvider} from "../src/interfaces/IWeightProvider.sol";
 
 contract DeployCore is Script {
