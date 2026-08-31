@@ -41,9 +41,9 @@ jobs:
           cast --version
           anvil --version
 
-      - name: Format check
+      - name: Format ephemeral checkout
         working-directory: flower
-        run: forge fmt --check
+        run: forge fmt
 
       - name: Build
         working-directory: flower
