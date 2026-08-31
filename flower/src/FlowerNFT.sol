@@ -21,20 +21,21 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     uint256 public constant RESERVED_SUPPLY = 2_222;
     uint256 public constant MAX_MINT_PER_TX = 20;
 
-    IERC20 public immutable quoteToken;
-    address public immutable treasury;
-    uint256 public immutable mintPrice;
+    IERC20 public immutable QUOTE_TOKEN;
+    address public immutable TREASURY;
+    uint256 public immutable MINT_PRICE;
 
     uint256 public publicMinted;
     uint256 public reservedMinted;
     uint256 private _nextTokenId = 1;
 
     bool public saleActive;
-    string private _baseTokenURI;
+    string private _baseTokenUri;
     IActivationTransferHook public activationHook;
 
     error SaleClosed();
     error InvalidQuantity();
+    error InvalidMintPrice();
     error PublicSupplyExceeded();
     error ReservedSupplyExceeded();
     error ActivationHookAlreadySet();
@@ -43,22 +44,23 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     event SaleActiveSet(bool active);
     event BaseURISet(string newBaseURI);
     event ActivationHookSet(address indexed hook);
+    event PublicMint(address indexed buyer, uint256 quantity, uint256 cost, uint256 firstTokenId);
+    event ReserveMint(address indexed to, uint256 quantity, uint256 firstTokenId);
 
     constructor(
         address initialOwner,
         IERC20 quoteToken_,
         address treasury_,
         uint256 mintPrice_,
-        string memory baseURI_
-    )
-        ERC721("FLOWER", "FLOWER-NFT")
-        Ownable(initialOwner)
-    {
+        string memory baseUri_
+    ) ERC721("FLOWER", "FLOWER-NFT") Ownable(initialOwner) {
         if (address(quoteToken_) == address(0) || treasury_ == address(0)) revert ZeroAddress();
-        quoteToken = quoteToken_;
-        treasury = treasury_;
-        mintPrice = mintPrice_;
-        _baseTokenURI = baseURI_;
+        if (mintPrice_ == 0) revert InvalidMintPrice();
+
+        QUOTE_TOKEN = quoteToken_;
+        TREASURY = treasury_;
+        MINT_PRICE = mintPrice_;
+        _baseTokenUri = baseUri_;
     }
 
     function mint(uint256 quantity) external nonReentrant {
@@ -66,11 +68,15 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
         if (quantity == 0 || quantity > MAX_MINT_PER_TX) revert InvalidQuantity();
         if (publicMinted + quantity > PUBLIC_SUPPLY) revert PublicSupplyExceeded();
 
-        uint256 cost = mintPrice * quantity;
-        quoteToken.safeTransferFrom(msg.sender, treasury, cost);
+        uint256 cost = MINT_PRICE * quantity;
+        uint256 firstTokenId = _nextTokenId;
 
         publicMinted += quantity;
-        for (uint256 i; i < quantity; ++i) {
+        emit PublicMint(msg.sender, quantity, cost, firstTokenId);
+
+        QUOTE_TOKEN.safeTransferFrom(msg.sender, TREASURY, cost);
+
+        for (uint256 i = 0; i < quantity; ++i) {
             _safeMint(msg.sender, _nextTokenId++);
         }
     }
@@ -78,14 +84,17 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     /// @notice Mints from the single 2,222-NFT non-public pool.
     /// @dev The deployment/treasury process decides how this pool is split between
     ///      team and protocol reserve; that unsettled split is not hard-coded here.
-    function reserveMint(address to, uint256 quantity) external onlyOwner {
+    function reserveMint(address to, uint256 quantity) external onlyOwner nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (quantity == 0 || reservedMinted + quantity > RESERVED_SUPPLY) {
             revert ReservedSupplyExceeded();
         }
 
+        uint256 firstTokenId = _nextTokenId;
         reservedMinted += quantity;
-        for (uint256 i; i < quantity; ++i) {
+        emit ReserveMint(to, quantity, firstTokenId);
+
+        for (uint256 i = 0; i < quantity; ++i) {
             _safeMint(to, _nextTokenId++);
         }
     }
@@ -96,7 +105,7 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     }
 
     function setBaseURI(string calldata newBaseURI) external onlyOwner {
-        _baseTokenURI = newBaseURI;
+        _baseTokenUri = newBaseURI;
         emit BaseURISet(newBaseURI);
     }
 
@@ -113,7 +122,7 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     }
 
     function _baseURI() internal view override returns (string memory) {
-        return _baseTokenURI;
+        return _baseTokenUri;
     }
 
     /// @dev OpenZeppelin 5.x transfer hook. The activation callback happens after
