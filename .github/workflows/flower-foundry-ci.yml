@@ -25,13 +25,10 @@ jobs:
         with:
           version: v1.8.1
 
-      - name: Materialize FLOWER project
+      - name: Install pinned dependencies
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p flower
-          base64 --decode flower_contracts_bundle.zip.b64 > /tmp/flower.zip
-          unzip -q /tmp/flower.zip -d flower
           cd flower
           mkdir -p lib
           git clone --quiet --depth 1 --branch v5.7.0 https://github.com/OpenZeppelin/openzeppelin-contracts.git lib/openzeppelin-contracts
