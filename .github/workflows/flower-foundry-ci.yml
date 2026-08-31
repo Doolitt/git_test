@@ -1,6 +1,9 @@
 name: FLOWER Foundry CI
 
 on:
+  push:
+    branches:
+      - flower-foundry-ci
   workflow_dispatch:
 
 concurrency:
