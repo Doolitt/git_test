@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IRewardDistributor} from "./interfaces/IRewardDistributor.sol";
@@ -36,6 +37,7 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
     error InvalidAmount();
     error NotNFTOwner();
     error ZeroAddress();
+    error InvalidContract();
     error UnsupportedRewardToken();
     error ClaimBatchTooLarge();
 
@@ -53,6 +55,10 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
             address(rewardToken_) == address(0) || address(nft_) == address(0)
                 || address(weightProvider_) == address(0) || activationManager_ == address(0)
         ) revert ZeroAddress();
+        if (
+            address(rewardToken_).code.length == 0 || address(nft_).code.length == 0
+                || address(weightProvider_).code.length == 0 || activationManager_.code.length == 0
+        ) revert InvalidContract();
 
         REWARD_TOKEN = rewardToken_;
         NFT = nft_;
@@ -71,7 +77,7 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
         uint256 received = REWARD_TOKEN.balanceOf(address(this)) - balanceBefore;
         if (received != amount) revert UnsupportedRewardToken();
 
-        accRewardPerWeight += (amount * WAD) / networkWeight;
+        accRewardPerWeight += Math.mulDiv(amount, WAD, networkWeight);
         totalFunded += amount;
 
         emit RewardsFunded(msg.sender, amount, networkWeight, accRewardPerWeight);
@@ -110,12 +116,18 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
     function pending(uint256 tokenId) external view returns (uint256) {
         uint256 currentWeight = WEIGHT_PROVIDER.weightOf(tokenId);
         uint256 delta = accRewardPerWeight - tokenAccPaid[tokenId];
-        return (currentWeight * delta) / WAD;
+        return Math.mulDiv(currentWeight, delta, WAD);
+    }
+
+    /// @notice Amount of funded reward tokens not yet paid out.
+    /// @dev Includes any harmless integer-division dust that remains in the distributor.
+    function accountedLiability() external view returns (uint256) {
+        return totalFunded - totalClaimed;
     }
 
     function _settle(uint256 tokenId, address beneficiary, uint256 weight) internal {
         uint256 delta = accRewardPerWeight - tokenAccPaid[tokenId];
-        uint256 accrued = (weight * delta) / WAD;
+        uint256 accrued = Math.mulDiv(weight, delta, WAD);
         if (accrued != 0) claimable[beneficiary] += accrued;
         emit TokenCheckpointed(tokenId, beneficiary, weight, accrued);
     }
