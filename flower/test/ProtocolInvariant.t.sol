@@ -9,7 +9,11 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FLOWER} from "../src/FLOWER.sol";
 import {FlowerNFT} from "../src/FlowerNFT.sol";
 import {ActivationManager} from "../src/ActivationManager.sol";
+import {RewardDistributor} from "../src/RewardDistributor.sol";
 import {IFLOWER} from "../src/interfaces/IFLOWER.sol";
+import {IActivationTransferHook} from "../src/interfaces/IActivationTransferHook.sol";
+import {IRewardDistributor} from "../src/interfaces/IRewardDistributor.sol";
+import {IWeightProvider} from "../src/interfaces/IWeightProvider.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 contract InvariantHandler is ERC721Holder {
@@ -17,6 +21,10 @@ contract InvariantHandler is ERC721Holder {
     uint256 internal constant MAX_ACTIVATION = 2_000_000_000 ether;
     uint256 internal constant MAX_TOP_UP = 250_000_000 ether;
     uint256 internal constant MAX_BURN = 25_000_000 ether;
+    uint16 internal constant DAYS_90 = 90;
+    uint16 internal constant DAYS_180 = 180;
+    uint16 internal constant DAYS_365 = 365;
+    uint16 internal constant DAYS_730 = 730;
 
     FLOWER public immutable FLOWER_TOKEN;
     FlowerNFT public immutable NFT;
@@ -73,13 +81,13 @@ contract InvariantHandler is ERC721Holder {
         if (activator == address(0)) return;
 
         uint16 nextDuration;
-        if (currentDuration == 90) {
+        if (currentDuration == DAYS_90) {
             uint256 choice = choiceSeed % 3;
-            nextDuration = choice == 0 ? 180 : choice == 1 ? 365 : 730;
-        } else if (currentDuration == 180) {
-            nextDuration = choiceSeed % 2 == 0 ? 365 : 730;
-        } else if (currentDuration == 365) {
-            nextDuration = 730;
+            nextDuration = choice == 0 ? DAYS_180 : choice == 1 ? DAYS_365 : DAYS_730;
+        } else if (currentDuration == DAYS_180) {
+            nextDuration = choiceSeed % 2 == 0 ? DAYS_365 : DAYS_730;
+        } else if (currentDuration == DAYS_365) {
+            nextDuration = DAYS_730;
         } else {
             return;
         }
@@ -89,10 +97,10 @@ contract InvariantHandler is ERC721Holder {
 
     function _duration(uint256 seed) internal pure returns (uint16) {
         uint256 choice = seed % 4;
-        if (choice == 0) return 90;
-        if (choice == 1) return 180;
-        if (choice == 2) return 365;
-        return 730;
+        if (choice == 0) return DAYS_90;
+        if (choice == 1) return DAYS_180;
+        if (choice == 2) return DAYS_365;
+        return DAYS_730;
     }
 
     function _range(uint256 seed, uint256 minValue, uint256 maxValue) internal pure returns (uint256) {
@@ -115,17 +123,28 @@ contract ProtocolInvariantTest is StdInvariant, Test {
         flower = new FLOWER(address(this));
         nft = new FlowerNFT(address(this), IERC20(address(quote)), address(0x7777), 250 ether, "ipfs://");
         manager = new ActivationManager(address(this), nft, IFLOWER(address(flower)));
+        RewardDistributor distributor = new RewardDistributor(
+            IERC20(address(quote)), nft, IWeightProvider(address(manager)), address(manager)
+        );
         handler = new InvariantHandler(flower, nft, manager);
 
+        nft.setActivationHook(IActivationTransferHook(address(manager)));
+        manager.setRewardDistributor(IRewardDistributor(address(distributor)));
+        manager.enableActivation();
+
         nft.reserveMint(address(handler), NFT_COUNT);
-        nft.finalizeReserveMinting();
         assertTrue(flower.transfer(address(handler), 100_000_000_000 ether));
 
-        targetContract(address(handler));
+        bytes4[] memory selectors = new bytes4[](4);
+        selectors[0] = handler.activate.selector;
+        selectors[1] = handler.increaseLock.selector;
+        selectors[2] = handler.burnForDevelopment.selector;
+        selectors[3] = handler.extendDuration.selector;
+        targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
     function invariantTotalWeightEqualsPositionWeights() public view {
-        uint256 summedWeight;
+        uint256 summedWeight = 0;
         for (uint256 tokenId = 1; tokenId <= NFT_COUNT; ++tokenId) {
             (,,,, uint256 weight) = manager.positions(tokenId);
             summedWeight += weight;
@@ -135,7 +154,7 @@ contract ProtocolInvariantTest is StdInvariant, Test {
     }
 
     function invariantEscrowBalanceEqualsActiveLockedFlower() public view {
-        uint256 summedLocked;
+        uint256 summedLocked = 0;
         for (uint256 tokenId = 1; tokenId <= NFT_COUNT; ++tokenId) {
             (, uint128 locked,,,) = manager.positions(tokenId);
             summedLocked += uint256(locked);
@@ -144,7 +163,7 @@ contract ProtocolInvariantTest is StdInvariant, Test {
     }
 
     function invariantPermanentBurnAccountingMatchesSupplyReduction() public view {
-        uint256 summedBurned;
+        uint256 summedBurned = 0;
         for (uint256 tokenId = 1; tokenId <= NFT_COUNT; ++tokenId) {
             summedBurned += manager.permanentBurned(tokenId);
         }
