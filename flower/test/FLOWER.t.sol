@@ -5,6 +5,9 @@ import {Test} from "forge-std/Test.sol";
 import {FLOWER} from "../src/FLOWER.sol";
 
 contract FLOWERTest is Test {
+    uint256 internal constant INITIAL_SUPPLY = 1_000_000_000_000 ether;
+    uint256 internal constant BURN_AMOUNT = 100_000_000 ether;
+
     FLOWER internal flower;
     address internal alice = address(0xA11CE);
 
@@ -13,8 +16,8 @@ contract FLOWERTest is Test {
     }
 
     function testInitialSupplyIsOneTrillion() public view {
-        assertEq(flower.totalSupply(), 1_000_000_000_000 ether);
-        assertEq(flower.balanceOf(alice), 1_000_000_000_000 ether);
+        assertEq(flower.totalSupply(), INITIAL_SUPPLY);
+        assertEq(flower.balanceOf(alice), INITIAL_SUPPLY);
     }
 
     function testNoOwnerOrMintSurface() public view {
@@ -24,7 +27,7 @@ contract FLOWERTest is Test {
 
     function testBurnReducesTotalSupply() public {
         vm.prank(alice);
-        flower.burn(100_000_000 ether);
-        assertEq(flower.totalSupply(), 999_900_000_000 ether);
+        flower.burn(BURN_AMOUNT);
+        assertEq(flower.totalSupply(), INITIAL_SUPPLY - BURN_AMOUNT);
     }
 }
