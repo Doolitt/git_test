@@ -51,10 +51,10 @@ contract ProtocolIntegrationTest is Test {
 
         nft.setActivationHook(IActivationTransferHook(address(manager)));
         manager.setRewardDistributor(IRewardDistributor(address(distributor)));
+        manager.enableActivation();
 
         nft.reserveMint(alice, 2); // token IDs 1 and 2
         nft.reserveMint(bob, 1); // token ID 3
-        nft.finalizeReserveMinting();
 
         vm.prank(alice);
         assertTrue(flower.transfer(bob, 10_000_000_000 ether));
@@ -68,7 +68,15 @@ contract ProtocolIntegrationTest is Test {
         assertTrue(usdg.approve(address(distributor), type(uint256).max));
     }
 
-    function testPublicMintPaysTreasuryDirectly() public {
+    function testReserveFinalizationLocksAllocationAndPublicMintPaysTreasury() public {
+        _completeReserveAllocation();
+        nft.finalizeReserveMinting();
+        assertEq(nft.reservedMinted(), nft.RESERVED_SUPPLY());
+        assertTrue(nft.reserveMintingFinalized());
+
+        vm.expectRevert(FlowerNFT.ReserveAlreadyFinalized.selector);
+        nft.reserveMint(alice, 1);
+
         nft.setSaleActive(true);
         usdg.mint(alice, REWARD_1000);
 
@@ -79,23 +87,18 @@ contract ProtocolIntegrationTest is Test {
 
         assertEq(usdg.balanceOf(treasury), 2 * MINT_PRICE);
         assertEq(nft.publicMinted(), 2);
-        assertEq(nft.balanceOf(alice), 4);
-        assertEq(nft.ownerOf(4), alice);
-        assertEq(nft.ownerOf(5), alice);
+        assertEq(nft.ownerOf(nft.RESERVED_SUPPLY() + 1), alice);
+        assertEq(nft.ownerOf(nft.RESERVED_SUPPLY() + 2), alice);
     }
 
     function testPublicSaleCannotOpenBeforeReserveFinalized() public {
-        FlowerNFT fresh = new FlowerNFT(
-            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
-        );
-
         vm.expectRevert(FlowerNFT.ReserveNotFinalized.selector);
-        fresh.setSaleActive(true);
+        nft.setSaleActive(true);
     }
 
-    function testReserveCannotMintAfterFinalization() public {
-        vm.expectRevert(FlowerNFT.ReserveAlreadyFinalized.selector);
-        nft.reserveMint(alice, 1);
+    function testReserveCannotFinalizeWhileAllocationIsIncomplete() public {
+        vm.expectRevert(FlowerNFT.ReserveIncomplete.selector);
+        nft.finalizeReserveMinting();
     }
 
     function testMetadataFreezeIsPermanent() public {
@@ -105,6 +108,48 @@ contract ProtocolIntegrationTest is Test {
 
         vm.expectRevert(FlowerNFT.MetadataIsFrozen.selector);
         nft.setBaseURI("ipfs://changed/");
+    }
+
+    function testActivationCannotStartBeforeOneWayWiring() public {
+        FlowerNFT freshNft = new FlowerNFT(
+            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
+        );
+        ActivationManager freshManager =
+            new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+        freshNft.reserveMint(alice, 1);
+
+        vm.prank(alice);
+        assertTrue(flower.approve(address(freshManager), type(uint256).max));
+
+        vm.prank(alice);
+        vm.expectRevert(ActivationManager.ActivationNotEnabled.selector);
+        freshManager.activate(1, FLOOR, DAYS_90);
+    }
+
+    function testEnableActivationRequiresInstalledHook() public {
+        FlowerNFT freshNft = new FlowerNFT(
+            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
+        );
+        ActivationManager freshManager =
+            new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+        RewardDistributor freshDistributor = new RewardDistributor(
+            IERC20(address(usdg)), freshNft, IWeightProvider(address(freshManager)), address(freshManager)
+        );
+        freshManager.setRewardDistributor(IRewardDistributor(address(freshDistributor)));
+
+        vm.expectRevert(ActivationManager.HookNotInstalled.selector);
+        freshManager.enableActivation();
+    }
+
+    function testRewardDistributorMustBeAContract() public {
+        FlowerNFT freshNft = new FlowerNFT(
+            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
+        );
+        ActivationManager freshManager =
+            new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+
+        vm.expectRevert(ActivationManager.InvalidRewardDistributor.selector);
+        freshManager.setRewardDistributor(IRewardDistributor(alice));
     }
 
     function testActivationEscrowsFlowerAndTracksWeight() public {
@@ -119,7 +164,7 @@ contract ProtocolIntegrationTest is Test {
         assertEq(flower.balanceOf(alice), beforeBalance - FLOOR);
     }
 
-    function testFailedActivationRollsBackState() public {
+    function testActivationFailureRollsBackState() public {
         vm.prank(bob);
         assertTrue(flower.approve(address(manager), 0));
 
@@ -130,6 +175,20 @@ contract ProtocolIntegrationTest is Test {
         assertEq(manager.weightOf(TOKEN_THREE), 0);
         assertEq(manager.totalWeight(), 0);
         assertEq(flower.balanceOf(address(manager)), 0);
+    }
+
+    function testSelfTransferDoesNotDetachActivation() public {
+        vm.prank(alice);
+        manager.activate(TOKEN_ONE, DEEP_LOCK, DAYS_365);
+        uint256 weightBefore = manager.weightOf(TOKEN_ONE);
+        uint256 detachedIdBefore = manager.nextDetachedLockId();
+
+        vm.prank(alice);
+        nft.transferFrom(alice, alice, TOKEN_ONE);
+
+        assertEq(manager.weightOf(TOKEN_ONE), weightBefore);
+        assertEq(manager.totalWeight(), weightBefore);
+        assertEq(manager.nextDetachedLockId(), detachedIdBefore);
     }
 
     function testTransferResetsWeightButCannotBypassOriginalLock() public {
@@ -300,6 +359,7 @@ contract ProtocolIntegrationTest is Test {
         assertEq(usdg.balanceOf(bob), REWARD_500);
         assertEq(distributor.totalFunded(), REWARD_1000 + REWARD_500);
         assertEq(distributor.totalClaimed(), REWARD_1000 + REWARD_500);
+        assertEq(distributor.accountedLiability(), 0);
         assertEq(usdg.balanceOf(address(distributor)), 0);
     }
 
@@ -341,5 +401,14 @@ contract ProtocolIntegrationTest is Test {
         vm.prank(alice);
         vm.expectRevert(RewardDistributor.ClaimBatchTooLarge.selector);
         distributor.claim(ids);
+    }
+
+    function _completeReserveAllocation() internal {
+        uint256 remaining = nft.RESERVED_SUPPLY() - nft.reservedMinted();
+        while (remaining != 0) {
+            uint256 quantity = remaining > 100 ? 100 : remaining;
+            nft.reserveMint(alice, quantity);
+            remaining -= quantity;
+        }
     }
 }
