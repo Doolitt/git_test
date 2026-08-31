@@ -221,7 +221,7 @@ contract ProtocolIntegrationTest is Test {
     }
 
     function testClaimBatchIsBounded() public {
-        uint256[] memory ids = new uint256[](RewardDistributor.MAX_CLAIM_BATCH() + 1);
+        uint256[] memory ids = new uint256[](distributor.MAX_CLAIM_BATCH() + 1);
         vm.prank(alice);
         vm.expectRevert(RewardDistributor.ClaimBatchTooLarge.selector);
         distributor.claim(ids);
