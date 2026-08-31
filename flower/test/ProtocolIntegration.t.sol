@@ -19,6 +19,16 @@ contract ProtocolIntegrationTest is Test {
     uint256 internal constant FLOOR = 50_000_000 ether;
     uint256 internal constant DEEP_LOCK = 500_000_000 ether;
     uint256 internal constant BURN_AMOUNT = 20_000_000 ether;
+    uint256 internal constant BASE_WEIGHT = 0.25e18;
+    uint256 internal constant REWARD_100 = 100 ether;
+    uint256 internal constant REWARD_500 = 500 ether;
+    uint256 internal constant REWARD_1000 = 1_000 ether;
+    uint16 internal constant DAYS_90 = 90;
+    uint16 internal constant DAYS_365 = 365;
+
+    uint256 internal constant TOKEN_ONE = 1;
+    uint256 internal constant TOKEN_TWO = 2;
+    uint256 internal constant TOKEN_THREE = 3;
 
     address internal alice = address(0xA11CE);
     address internal bob = address(0xB0B);
@@ -44,25 +54,26 @@ contract ProtocolIntegrationTest is Test {
 
         nft.reserveMint(alice, 2); // token IDs 1 and 2
         nft.reserveMint(bob, 1); // token ID 3
+        nft.finalizeReserveMinting();
 
         vm.prank(alice);
-        flower.transfer(bob, 10_000_000_000 ether);
+        assertTrue(flower.transfer(bob, 10_000_000_000 ether));
 
         vm.prank(alice);
-        flower.approve(address(manager), type(uint256).max);
+        assertTrue(flower.approve(address(manager), type(uint256).max));
         vm.prank(bob);
-        flower.approve(address(manager), type(uint256).max);
+        assertTrue(flower.approve(address(manager), type(uint256).max));
 
         usdg.mint(address(this), 10_000 ether);
-        usdg.approve(address(distributor), type(uint256).max);
+        assertTrue(usdg.approve(address(distributor), type(uint256).max));
     }
 
     function testPublicMintPaysTreasuryDirectly() public {
         nft.setSaleActive(true);
-        usdg.mint(alice, 1_000 ether);
+        usdg.mint(alice, REWARD_1000);
 
         vm.startPrank(alice);
-        usdg.approve(address(nft), type(uint256).max);
+        assertTrue(usdg.approve(address(nft), type(uint256).max));
         nft.mint(2);
         vm.stopPrank();
 
@@ -73,29 +84,65 @@ contract ProtocolIntegrationTest is Test {
         assertEq(nft.ownerOf(5), alice);
     }
 
+    function testPublicSaleCannotOpenBeforeReserveFinalized() public {
+        FlowerNFT fresh = new FlowerNFT(
+            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
+        );
+
+        vm.expectRevert(FlowerNFT.ReserveNotFinalized.selector);
+        fresh.setSaleActive(true);
+    }
+
+    function testReserveCannotMintAfterFinalization() public {
+        vm.expectRevert(FlowerNFT.ReserveAlreadyFinalized.selector);
+        nft.reserveMint(alice, 1);
+    }
+
+    function testMetadataFreezeIsPermanent() public {
+        nft.setBaseURI("ipfs://final/");
+        nft.freezeMetadata();
+        assertTrue(nft.metadataFrozen());
+
+        vm.expectRevert(FlowerNFT.MetadataIsFrozen.selector);
+        nft.setBaseURI("ipfs://changed/");
+    }
+
     function testActivationEscrowsFlowerAndTracksWeight() public {
         uint256 beforeBalance = flower.balanceOf(alice);
 
         vm.prank(alice);
-        manager.activate(1, FLOOR, 90);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
 
-        assertEq(manager.weightOf(1), 0.25e18);
-        assertEq(manager.totalWeight(), 0.25e18);
+        assertEq(manager.weightOf(TOKEN_ONE), BASE_WEIGHT);
+        assertEq(manager.totalWeight(), BASE_WEIGHT);
         assertEq(flower.balanceOf(address(manager)), FLOOR);
         assertEq(flower.balanceOf(alice), beforeBalance - FLOOR);
     }
 
+    function testFailedActivationRollsBackState() public {
+        vm.prank(bob);
+        assertTrue(flower.approve(address(manager), 0));
+
+        vm.prank(bob);
+        vm.expectRevert();
+        manager.activate(TOKEN_THREE, FLOOR, DAYS_90);
+
+        assertEq(manager.weightOf(TOKEN_THREE), 0);
+        assertEq(manager.totalWeight(), 0);
+        assertEq(flower.balanceOf(address(manager)), 0);
+    }
+
     function testTransferResetsWeightButCannotBypassOriginalLock() public {
         vm.prank(alice);
-        manager.activate(1, DEEP_LOCK, 365);
+        manager.activate(TOKEN_ONE, DEEP_LOCK, DAYS_365);
 
-        (,, uint64 unlockAt,, uint256 oldWeight) = manager.positions(1);
+        (,, uint64 unlockAt,, uint256 oldWeight) = manager.positions(TOKEN_ONE);
         assertGt(oldWeight, 0);
 
         vm.prank(alice);
-        nft.transferFrom(alice, bob, 1);
+        nft.transferFrom(alice, bob, TOKEN_ONE);
 
-        assertEq(manager.weightOf(1), 0);
+        assertEq(manager.weightOf(TOKEN_ONE), 0);
         assertEq(manager.totalWeight(), 0);
 
         (address beneficiary, uint128 amount, uint64 detachedUnlock, bool claimed) = manager.detachedLocks(1);
@@ -118,17 +165,17 @@ contract ProtocolIntegrationTest is Test {
 
     function testBuyerCanReactivateImmediatelyWhileSellerLockRemainsDetached() public {
         vm.prank(alice);
-        manager.activate(1, DEEP_LOCK, 365);
+        manager.activate(TOKEN_ONE, DEEP_LOCK, DAYS_365);
 
         vm.prank(alice);
-        nft.transferFrom(alice, bob, 1);
+        nft.transferFrom(alice, bob, TOKEN_ONE);
 
         vm.prank(bob);
-        manager.activate(1, FLOOR, 90);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
 
-        assertEq(nft.ownerOf(1), bob);
-        assertEq(manager.weightOf(1), 0.25e18);
-        assertEq(manager.totalWeight(), 0.25e18);
+        assertEq(nft.ownerOf(TOKEN_ONE), bob);
+        assertEq(manager.weightOf(TOKEN_ONE), BASE_WEIGHT);
+        assertEq(manager.totalWeight(), BASE_WEIGHT);
 
         (address beneficiary, uint128 amount,, bool claimed) = manager.detachedLocks(1);
         assertEq(beneficiary, alice);
@@ -136,83 +183,152 @@ contract ProtocolIntegrationTest is Test {
         assertFalse(claimed);
     }
 
+    function testIncreaseLockRenewsFullCommitmentPeriod() public {
+        vm.prank(alice);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
+        (,, uint64 originalUnlock,,) = manager.positions(TOKEN_ONE);
+
+        vm.warp(block.timestamp + 80 days);
+        vm.prank(alice);
+        manager.increaseLock(TOKEN_ONE, FLOOR);
+        (, uint128 locked, uint64 renewedUnlock,, uint256 newWeight) = manager.positions(TOKEN_ONE);
+
+        assertEq(uint256(locked), 2 * FLOOR);
+        assertGt(renewedUnlock, originalUnlock);
+        assertEq(uint256(renewedUnlock), block.timestamp + 90 days);
+        assertGt(newWeight, BASE_WEIGHT);
+
+        vm.warp(uint256(originalUnlock) + 1);
+        vm.prank(alice);
+        vm.expectRevert(ActivationManager.LockStillCommitted.selector);
+        manager.withdraw(TOKEN_ONE);
+
+        vm.warp(uint256(renewedUnlock));
+        vm.prank(alice);
+        manager.withdraw(TOKEN_ONE);
+        assertEq(manager.totalWeight(), 0);
+    }
+
+    function testDurationCanOnlyExtendAndRestartsCommitment() public {
+        vm.prank(alice);
+        manager.activate(TOKEN_ONE, DEEP_LOCK, DAYS_90);
+        (,, uint64 originalUnlock,, uint256 oldWeight) = manager.positions(TOKEN_ONE);
+
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(alice);
+        manager.extendDuration(TOKEN_ONE, DAYS_365);
+
+        (,, uint64 extendedUnlock, uint16 durationDays, uint256 newWeight) = manager.positions(TOKEN_ONE);
+        assertEq(durationDays, DAYS_365);
+        assertEq(uint256(extendedUnlock), block.timestamp + 365 days);
+        assertGt(extendedUnlock, originalUnlock);
+        assertGt(newWeight, oldWeight);
+
+        vm.prank(alice);
+        vm.expectRevert(ActivationManager.DurationNotExtended.selector);
+        manager.extendDuration(TOKEN_ONE, 180);
+    }
+
+    function testTopUpCheckpointsRewardsBeforeNewWeightApplies() public {
+        vm.prank(alice);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
+        distributor.fund(REWARD_100);
+
+        vm.prank(alice);
+        manager.increaseLock(TOKEN_ONE, FLOOR);
+        assertEq(distributor.claimable(alice), REWARD_100);
+
+        distributor.fund(REWARD_100);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = TOKEN_ONE;
+
+        vm.prank(alice);
+        distributor.claim(ids);
+        assertEq(usdg.balanceOf(alice), 2 * REWARD_100);
+    }
+
     function testPermanentBurnDevelopmentSurvivesTransfer() public {
         uint256 supplyBefore = flower.totalSupply();
 
         vm.prank(alice);
-        manager.activate(2, FLOOR, 90);
+        manager.activate(TOKEN_TWO, FLOOR, DAYS_90);
         vm.prank(alice);
-        manager.burnForDevelopment(2, BURN_AMOUNT);
+        manager.burnForDevelopment(TOKEN_TWO, BURN_AMOUNT);
 
-        uint256 developedWeight = manager.weightOf(2);
-        assertGt(developedWeight, 0.25e18);
-        assertEq(manager.permanentBurned(2), BURN_AMOUNT);
+        uint256 developedWeight = manager.weightOf(TOKEN_TWO);
+        assertGt(developedWeight, BASE_WEIGHT);
+        assertEq(manager.permanentBurned(TOKEN_TWO), BURN_AMOUNT);
         assertEq(flower.totalSupply(), supplyBefore - BURN_AMOUNT);
 
         vm.prank(alice);
-        nft.transferFrom(alice, bob, 2);
-        assertEq(manager.weightOf(2), 0);
+        nft.transferFrom(alice, bob, TOKEN_TWO);
+        assertEq(manager.weightOf(TOKEN_TWO), 0);
 
         vm.prank(bob);
-        manager.activate(2, FLOOR, 90);
+        manager.activate(TOKEN_TWO, FLOOR, DAYS_90);
 
-        assertEq(manager.permanentBurned(2), BURN_AMOUNT);
-        assertEq(manager.weightOf(2), manager.computeWeight(FLOOR, BURN_AMOUNT, 90));
+        assertEq(manager.permanentBurned(TOKEN_TWO), BURN_AMOUNT);
+        assertEq(manager.weightOf(TOKEN_TWO), manager.computeWeight(FLOOR, BURN_AMOUNT, DAYS_90));
     }
 
     function testRewardsCheckpointSellerAndDoNotLeakToBuyer() public {
         vm.prank(alice);
-        manager.activate(1, FLOOR, 90);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
 
-        distributor.fund(1_000 ether);
-        assertEq(distributor.pending(1), 1_000 ether);
+        distributor.fund(REWARD_1000);
+        assertEq(distributor.pending(TOKEN_ONE), REWARD_1000);
 
         vm.prank(alice);
-        nft.transferFrom(alice, bob, 1);
+        nft.transferFrom(alice, bob, TOKEN_ONE);
 
-        assertEq(distributor.claimable(alice), 1_000 ether);
-        assertEq(distributor.pending(1), 0);
+        assertEq(distributor.claimable(alice), REWARD_1000);
+        assertEq(distributor.pending(TOKEN_ONE), 0);
 
         vm.prank(bob);
-        manager.activate(1, FLOOR, 90);
-        distributor.fund(500 ether);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
+        distributor.fund(REWARD_500);
 
         uint256[] memory ids = new uint256[](1);
-        ids[0] = 1;
+        ids[0] = TOKEN_ONE;
 
         vm.prank(bob);
         distributor.claim(ids);
         vm.prank(alice);
         distributor.claimCredits();
 
-        assertEq(usdg.balanceOf(alice), 1_000 ether);
-        assertEq(usdg.balanceOf(bob), 500 ether);
-        assertEq(distributor.totalFunded(), 1_500 ether);
-        assertEq(distributor.totalClaimed(), 1_500 ether);
+        assertEq(usdg.balanceOf(alice), REWARD_1000);
+        assertEq(usdg.balanceOf(bob), REWARD_500);
+        assertEq(distributor.totalFunded(), REWARD_1000 + REWARD_500);
+        assertEq(distributor.totalClaimed(), REWARD_1000 + REWARD_500);
         assertEq(usdg.balanceOf(address(distributor)), 0);
     }
 
     function testMinimumCommitmentKeepsWeightUntilExplicitWithdrawal() public {
         vm.prank(alice);
-        manager.activate(1, FLOOR, 90);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
 
-        (,, uint64 unlockAt,,) = manager.positions(1);
+        (,, uint64 unlockAt,,) = manager.positions(TOKEN_ONE);
         vm.warp(uint256(unlockAt) + 1 days);
 
-        // Current v0.1 semantics: expiry is the earliest withdrawal date, not an automatic weight expiry.
-        assertEq(manager.weightOf(1), 0.25e18);
-        assertEq(manager.totalWeight(), 0.25e18);
+        assertEq(manager.weightOf(TOKEN_ONE), BASE_WEIGHT);
+        assertEq(manager.totalWeight(), BASE_WEIGHT);
 
-        distributor.fund(100 ether);
+        distributor.fund(REWARD_100);
 
         vm.prank(alice);
-        manager.withdraw(1);
-        assertEq(manager.weightOf(1), 0);
+        manager.withdraw(TOKEN_ONE);
+        assertEq(manager.weightOf(TOKEN_ONE), 0);
         assertEq(manager.totalWeight(), 0);
 
         vm.prank(alice);
         distributor.claimCredits();
-        assertEq(usdg.balanceOf(alice), 100 ether);
+        assertEq(usdg.balanceOf(alice), REWARD_100);
+    }
+
+    function testOnlyNFTCanInvokeTransferHook() public {
+        vm.prank(alice);
+        vm.expectRevert(ActivationManager.NotFlowerNFT.selector);
+        manager.onNftTransfer(TOKEN_ONE, alice, bob);
     }
 
     function testFundingWithoutActiveWeightReverts() public {
