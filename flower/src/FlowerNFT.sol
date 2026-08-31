@@ -40,8 +40,10 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     error InvalidMintPrice();
     error PublicSupplyExceeded();
     error ReservedSupplyExceeded();
+    error ReserveIncomplete();
     error ReserveAlreadyFinalized();
     error ReserveNotFinalized();
+    error UnsupportedQuoteToken();
     error MetadataIsFrozen();
     error ActivationHookAlreadySet();
     error ZeroAddress();
@@ -77,11 +79,15 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
 
         uint256 cost = MINT_PRICE * quantity;
         uint256 firstTokenId = _nextTokenId;
+        uint256 treasuryBalanceBefore = QUOTE_TOKEN.balanceOf(TREASURY);
 
         publicMinted += quantity;
         emit PublicMint(msg.sender, quantity, cost, firstTokenId);
 
         QUOTE_TOKEN.safeTransferFrom(msg.sender, TREASURY, cost);
+        if (QUOTE_TOKEN.balanceOf(TREASURY) - treasuryBalanceBefore != cost) {
+            revert UnsupportedQuoteToken();
+        }
 
         for (uint256 i = 0; i < quantity; ++i) {
             _safeMint(msg.sender, _nextTokenId++);
@@ -90,7 +96,7 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
 
     /// @notice Mints from the single 2,222-NFT non-public pool.
     /// @dev The deployment/treasury process decides how this pool is split between
-    ///      team and protocol reserve. The pool must be finalized before public sale begins.
+    ///      team and protocol reserve. All 2,222 must be allocated before public sale.
     function reserveMint(address to, uint256 quantity) external nonReentrant onlyOwner {
         if (reserveMintingFinalized) revert ReserveAlreadyFinalized();
         if (to == address(0)) revert ZeroAddress();
@@ -108,10 +114,11 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Permanently closes the non-public mint allocation.
-    /// @dev Public sale cannot be activated until this is called, making the final
-    ///      reserved supply visible and immutable before buyers enter.
+    /// @dev The full 2,222 reserve must already be allocated, preserving the declared
+    ///      7,777 maximum collection size before public buyers enter.
     function finalizeReserveMinting() external onlyOwner {
         if (reserveMintingFinalized) revert ReserveAlreadyFinalized();
+        if (reservedMinted != RESERVED_SUPPLY) revert ReserveIncomplete();
         reserveMintingFinalized = true;
         emit ReserveMintingFinalized(reservedMinted);
     }
@@ -151,9 +158,8 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
         return _baseTokenUri;
     }
 
-    /// @dev OpenZeppelin 5.x transfer hook. The activation callback happens after
-    ///      ERC-721 ownership state is updated. If the callback reverts, the entire
-    ///      NFT transfer reverts.
+    /// @dev OpenZeppelin 5.x transfer hook. A true ownership change resets temporary
+    ///      activation. A self-transfer does not detach an otherwise valid lock.
     function _update(address to, uint256 tokenId, address auth)
         internal
         override
@@ -161,8 +167,10 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     {
         from = super._update(to, tokenId, auth);
 
-        // Skip minting. There is no burn function in this contract.
-        if (from != address(0) && to != address(0) && address(activationHook) != address(0)) {
+        if (
+            from != address(0) && to != address(0) && from != to
+                && address(activationHook) != address(0)
+        ) {
             activationHook.onNftTransfer(tokenId, from, to);
         }
     }
