@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -21,11 +22,10 @@ import {IFLOWER} from "./interfaces/IFLOWER.sol";
 /// IMPORTANT DURATION SEMANTICS IN THIS REFERENCE IMPLEMENTATION:
 /// The selected duration is a MINIMUM lock commitment. The position keeps earning
 /// its selected multiplier after the minimum period until the activator withdraws
-/// or transfers the NFT. This avoids stale global-weight accounting from automatic
-/// expiries. If the desired economic rule is "boost automatically ends at expiry",
-/// implement epoch-aligned expiries/checkpointing before production deployment.
+/// or transfers the NFT. Increasing a lock renews the full selected commitment period.
 contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
 
     uint256 public constant WAD = 1e18;
     uint256 public constant ACTIVATION_FLOOR = 50_000_000 ether;
@@ -70,14 +70,13 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     error NotActivator();
     error BelowActivationFloor();
     error InvalidDuration();
+    error DurationNotExtended();
     error LockStillCommitted();
     error NotFlowerNFT();
     error InvalidAmount();
     error RewardDistributorAlreadySet();
     error ZeroAddress();
     error DetachedLockUnavailable();
-    error LockAmountOverflow();
-    error TimestampOverflow();
 
     event RewardDistributorSet(address indexed distributor);
     event Activated(
@@ -88,7 +87,20 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         uint64 unlockAt,
         uint256 weight
     );
-    event LockIncreased(uint256 indexed tokenId, uint256 added, uint256 newLocked, uint256 newWeight);
+    event LockIncreased(
+        uint256 indexed tokenId,
+        uint256 added,
+        uint256 newLocked,
+        uint64 newUnlockAt,
+        uint256 newWeight
+    );
+    event DurationExtended(
+        uint256 indexed tokenId,
+        uint16 oldDurationDays,
+        uint16 newDurationDays,
+        uint64 newUnlockAt,
+        uint256 newWeight
+    );
     event PermanentBurn(
         uint256 indexed tokenId,
         address indexed owner,
@@ -124,7 +136,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         if (positions[tokenId].activator != address(0)) revert PositionExists();
         if (lockAmount < ACTIVATION_FLOOR) revert BelowActivationFloor();
 
-        uint128 storedLock = _toUint128(lockAmount);
+        uint128 storedLock = lockAmount.toUint128();
         uint64 unlockAt = _unlockTimestamp(durationDays);
         uint256 newWeight = computeWeight(lockAmount, permanentBurned[tokenId], durationDays);
 
@@ -143,6 +155,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         IERC20(address(FLOWER_TOKEN)).safeTransferFrom(msg.sender, address(this), lockAmount);
     }
 
+    /// @notice Adds FLOWER to an active position and renews the full selected commitment period.
+    /// @dev A unified position is used instead of tranches: topping up extends the unlock date for all locked FLOWER.
     function increaseLock(uint256 tokenId, uint256 additionalAmount) external nonReentrant {
         if (additionalAmount == 0) revert InvalidAmount();
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
@@ -153,16 +167,44 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
         uint256 oldWeight = p.weight;
         uint256 newLocked = uint256(p.locked) + additionalAmount;
+        uint64 newUnlockAt = _unlockTimestamp(p.durationDays);
         uint256 newWeight = computeWeight(newLocked, permanentBurned[tokenId], p.durationDays);
 
-        p.locked = _toUint128(newLocked);
+        p.locked = newLocked.toUint128();
+        p.unlockAt = newUnlockAt;
         p.weight = newWeight;
         _replaceTotalWeight(oldWeight, newWeight);
 
-        emit LockIncreased(tokenId, additionalAmount, newLocked, newWeight);
+        emit LockIncreased(tokenId, additionalAmount, newLocked, newUnlockAt, newWeight);
         _notifyWeightChange(tokenId, msg.sender, oldWeight, newWeight);
 
         IERC20(address(FLOWER_TOKEN)).safeTransferFrom(msg.sender, address(this), additionalAmount);
+    }
+
+    /// @notice Moves an active position to a strictly longer supported duration.
+    /// @dev The new duration runs in full from the extension transaction.
+    function extendDuration(uint256 tokenId, uint16 newDurationDays) external nonReentrant {
+        if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
+
+        Position storage p = positions[tokenId];
+        if (p.activator == address(0)) revert NoPosition();
+        if (p.activator != msg.sender) revert NotActivator();
+
+        _durationMultiplier(newDurationDays);
+        uint16 oldDurationDays = p.durationDays;
+        if (newDurationDays <= oldDurationDays) revert DurationNotExtended();
+
+        uint256 oldWeight = p.weight;
+        uint64 newUnlockAt = _unlockTimestamp(newDurationDays);
+        uint256 newWeight = computeWeight(uint256(p.locked), permanentBurned[tokenId], newDurationDays);
+
+        p.durationDays = newDurationDays;
+        p.unlockAt = newUnlockAt;
+        p.weight = newWeight;
+        _replaceTotalWeight(oldWeight, newWeight);
+
+        emit DurationExtended(tokenId, oldDurationDays, newDurationDays, newUnlockAt, newWeight);
+        _notifyWeightChange(tokenId, msg.sender, oldWeight, newWeight);
     }
 
     function burnForDevelopment(uint256 tokenId, uint256 amount) external nonReentrant {
@@ -173,8 +215,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         permanentBurned[tokenId] = cumulativeBurn;
 
         Position storage p = positions[tokenId];
-        uint256 newWeight;
-        uint256 oldWeight;
+        uint256 newWeight = 0;
+        uint256 oldWeight = 0;
 
         if (p.activator != address(0)) {
             oldWeight = p.weight;
@@ -289,14 +331,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
     function _unlockTimestamp(uint16 durationDays) internal view returns (uint64) {
         _durationMultiplier(durationDays);
-        uint256 unlockAt = block.timestamp + uint256(durationDays) * 1 days;
-        if (unlockAt > type(uint64).max) revert TimestampOverflow();
-        return uint64(unlockAt);
-    }
-
-    function _toUint128(uint256 amount) internal pure returns (uint128) {
-        if (amount > type(uint128).max) revert LockAmountOverflow();
-        return uint128(amount);
+        return (block.timestamp + uint256(durationDays) * 1 days).toUint64();
     }
 
     function _replaceTotalWeight(uint256 oldWeight, uint256 newWeight) internal {
