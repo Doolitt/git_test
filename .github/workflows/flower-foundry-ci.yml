@@ -1,0 +1,66 @@
+name: FLOWER Foundry CI
+
+on:
+  push:
+    branches:
+      - flower-foundry-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: Materialize FLOWER project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p flower
+          base64 --decode flower_contracts_bundle.zip.b64 > /tmp/flower.zip
+          unzip -q /tmp/flower.zip -d flower
+          cd flower
+          mkdir -p lib
+          git clone --quiet --depth 1 --branch v5.7.0 https://github.com/OpenZeppelin/openzeppelin-contracts.git lib/openzeppelin-contracts
+          git clone --quiet --depth 1 --branch v4.1.2 https://github.com/PaulRBerg/prb-math.git lib/prb-math
+          git clone --quiet --depth 1 --branch v1.12.0 https://github.com/foundry-rs/forge-std.git lib/forge-std
+
+      - name: Toolchain versions
+        run: |
+          forge --version
+          cast --version
+          anvil --version
+
+      - name: Format check
+        working-directory: flower
+        run: forge fmt --check
+
+      - name: Build
+        working-directory: flower
+        run: forge build --sizes
+
+      - name: Unit and fuzz tests
+        working-directory: flower
+        run: forge test -vvv
+
+      - name: Gas snapshot
+        working-directory: flower
+        run: forge snapshot
+
+      - name: Upload test project on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flower-foundry-failure-project
+          path: flower
+          retention-days: 7
