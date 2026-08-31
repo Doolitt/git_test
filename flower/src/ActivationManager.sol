@@ -11,6 +11,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 
 import {IActivationTransferHook} from "./interfaces/IActivationTransferHook.sol";
+import {IFlowerNFTActivationStatus} from "./interfaces/IFlowerNFTActivationStatus.sol";
 import {IWeightProvider} from "./interfaces/IWeightProvider.sol";
 import {IRewardDistributor} from "./interfaces/IRewardDistributor.sol";
 import {IFLOWER} from "./interfaces/IFLOWER.sol";
@@ -42,6 +43,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     IFLOWER public immutable FLOWER_TOKEN;
 
     IRewardDistributor public rewardDistributor;
+    bool public activationEnabled;
     uint256 public override totalWeight;
     uint256 public nextDetachedLockId = 1;
 
@@ -75,10 +77,16 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     error NotFlowerNFT();
     error InvalidAmount();
     error RewardDistributorAlreadySet();
+    error InvalidRewardDistributor();
+    error RewardDistributorNotSet();
+    error ActivationAlreadyEnabled();
+    error ActivationNotEnabled();
+    error HookNotInstalled();
     error ZeroAddress();
     error DetachedLockUnavailable();
 
     event RewardDistributorSet(address indexed distributor);
+    event ActivationEnabled(address indexed activationHook, address indexed rewardDistributor);
     event Activated(
         uint256 indexed tokenId,
         address indexed activator,
@@ -118,6 +126,11 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     );
     event DetachedLockClaimed(uint256 indexed detachedId, address indexed beneficiary, uint256 amount);
 
+    modifier whenActivationEnabled() {
+        if (!activationEnabled) revert ActivationNotEnabled();
+        _;
+    }
+
     constructor(address initialOwner, IERC721 nft_, IFLOWER flower_) Ownable(initialOwner) {
         if (address(nft_) == address(0) || address(flower_) == address(0)) revert ZeroAddress();
         NFT = nft_;
@@ -127,11 +140,29 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     function setRewardDistributor(IRewardDistributor distributor) external onlyOwner {
         if (address(rewardDistributor) != address(0)) revert RewardDistributorAlreadySet();
         if (address(distributor) == address(0)) revert ZeroAddress();
+        if (address(distributor).code.length == 0) revert InvalidRewardDistributor();
         rewardDistributor = distributor;
         emit RewardDistributorSet(address(distributor));
     }
 
-    function activate(uint256 tokenId, uint256 lockAmount, uint16 durationDays) external nonReentrant {
+    /// @notice One-way switch that opens economic activation after the NFT transfer hook
+    ///         and reward distributor are both permanently wired.
+    function enableActivation() external onlyOwner {
+        if (activationEnabled) revert ActivationAlreadyEnabled();
+        if (address(rewardDistributor) == address(0)) revert RewardDistributorNotSet();
+
+        address installedHook = IFlowerNFTActivationStatus(address(NFT)).activationHook();
+        if (installedHook != address(this)) revert HookNotInstalled();
+
+        activationEnabled = true;
+        emit ActivationEnabled(installedHook, address(rewardDistributor));
+    }
+
+    function activate(uint256 tokenId, uint256 lockAmount, uint16 durationDays)
+        external
+        nonReentrant
+        whenActivationEnabled
+    {
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
         if (positions[tokenId].activator != address(0)) revert PositionExists();
         if (lockAmount < ACTIVATION_FLOOR) revert BelowActivationFloor();
@@ -157,7 +188,11 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
     /// @notice Adds FLOWER to an active position and renews the full selected commitment period.
     /// @dev A unified position is used instead of tranches: topping up extends the unlock date for all locked FLOWER.
-    function increaseLock(uint256 tokenId, uint256 additionalAmount) external nonReentrant {
+    function increaseLock(uint256 tokenId, uint256 additionalAmount)
+        external
+        nonReentrant
+        whenActivationEnabled
+    {
         if (additionalAmount == 0) revert InvalidAmount();
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
@@ -183,7 +218,11 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
     /// @notice Moves an active position to a strictly longer supported duration.
     /// @dev The new duration runs in full from the extension transaction.
-    function extendDuration(uint256 tokenId, uint16 newDurationDays) external nonReentrant {
+    function extendDuration(uint256 tokenId, uint16 newDurationDays)
+        external
+        nonReentrant
+        whenActivationEnabled
+    {
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
         Position storage p = positions[tokenId];
@@ -207,7 +246,11 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         _notifyWeightChange(tokenId, msg.sender, oldWeight, newWeight);
     }
 
-    function burnForDevelopment(uint256 tokenId, uint256 amount) external nonReentrant {
+    function burnForDevelopment(uint256 tokenId, uint256 amount)
+        external
+        nonReentrant
+        whenActivationEnabled
+    {
         if (amount == 0) revert InvalidAmount();
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
