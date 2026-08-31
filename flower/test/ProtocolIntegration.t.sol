@@ -45,9 +45,8 @@ contract ProtocolIntegrationTest is Test {
         flower = new FLOWER(alice);
         nft = new FlowerNFT(address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://flower/");
         manager = new ActivationManager(address(this), nft, IFLOWER(address(flower)));
-        distributor = new RewardDistributor(
-            IERC20(address(usdg)), nft, IWeightProvider(address(manager)), address(manager)
-        );
+        distributor =
+            new RewardDistributor(IERC20(address(usdg)), nft, IWeightProvider(address(manager)), address(manager));
 
         nft.setActivationHook(IActivationTransferHook(address(manager)));
         manager.setRewardDistributor(IRewardDistributor(address(distributor)));
@@ -111,11 +110,8 @@ contract ProtocolIntegrationTest is Test {
     }
 
     function testActivationCannotStartBeforeOneWayWiring() public {
-        FlowerNFT freshNft = new FlowerNFT(
-            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
-        );
-        ActivationManager freshManager =
-            new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+        FlowerNFT freshNft = new FlowerNFT(address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/");
+        ActivationManager freshManager = new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
         freshNft.reserveMint(alice, 1);
 
         vm.prank(alice);
@@ -127,11 +123,8 @@ contract ProtocolIntegrationTest is Test {
     }
 
     function testEnableActivationRequiresInstalledHook() public {
-        FlowerNFT freshNft = new FlowerNFT(
-            address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
-        );
-        ActivationManager freshManager =
-            new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+        FlowerNFT freshNft = new FlowerNFT(address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/");
+        ActivationManager freshManager = new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
         RewardDistributor freshDistributor = new RewardDistributor(
             IERC20(address(usdg)), freshNft, IWeightProvider(address(freshManager)), address(freshManager)
         );
@@ -141,12 +134,27 @@ contract ProtocolIntegrationTest is Test {
         freshManager.enableActivation();
     }
 
-    function testRewardDistributorMustBeAContract() public {
+    function testRejectsDistributorBoundToDifferentManager() public {
         FlowerNFT freshNft = new FlowerNFT(
             address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/"
         );
         ActivationManager freshManager =
             new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+        ActivationManager wrongManager =
+            new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
+        RewardDistributor wrongDistributor = new RewardDistributor(
+            IERC20(address(usdg)), freshNft, IWeightProvider(address(wrongManager)), address(wrongManager)
+        );
+
+        freshNft.setActivationHook(IActivationTransferHook(address(freshManager)));
+
+        vm.expectRevert(ActivationManager.InvalidRewardDistributor.selector);
+        freshManager.setRewardDistributor(IRewardDistributor(address(wrongDistributor)));
+    }
+
+    function testRewardDistributorMustBeAContract() public {
+        FlowerNFT freshNft = new FlowerNFT(address(this), IERC20(address(usdg)), treasury, MINT_PRICE, "ipfs://fresh/");
+        ActivationManager freshManager = new ActivationManager(address(this), freshNft, IFLOWER(address(flower)));
 
         vm.expectRevert(ActivationManager.InvalidRewardDistributor.selector);
         freshManager.setRewardDistributor(IRewardDistributor(alice));
@@ -303,7 +311,40 @@ contract ProtocolIntegrationTest is Test {
 
         vm.prank(alice);
         distributor.claim(ids);
-        assertEq(usdg.balanceOf(alice), 2 * REWARD_100);
+
+        uint256 expectedPaid = 2 * REWARD_100 - 1;
+        assertEq(usdg.balanceOf(alice), expectedPaid);
+        assertEq(usdg.balanceOf(address(distributor)), 1);
+        assertEq(distributor.accountedLiability(), 1);
+    }
+
+    function testTwoHolderRewardClaimsRemainSolventWithUnequalWeights() public {
+        vm.prank(alice);
+        manager.activate(TOKEN_ONE, FLOOR, DAYS_90);
+        vm.prank(bob);
+        manager.activate(TOKEN_THREE, DEEP_LOCK, DAYS_365);
+
+        uint256 funded = 777 ether;
+        distributor.fund(funded);
+
+        uint256[] memory aliceIds = new uint256[](1);
+        aliceIds[0] = TOKEN_ONE;
+        uint256[] memory bobIds = new uint256[](1);
+        bobIds[0] = TOKEN_THREE;
+
+        vm.prank(alice);
+        distributor.claim(aliceIds);
+        vm.prank(bob);
+        distributor.claim(bobIds);
+
+        uint256 totalPaid = usdg.balanceOf(alice) + usdg.balanceOf(bob);
+        uint256 liability = distributor.accountedLiability();
+
+        assertLe(totalPaid, funded);
+        assertEq(distributor.totalClaimed(), totalPaid);
+        assertEq(distributor.totalFunded(), funded);
+        assertEq(usdg.balanceOf(address(distributor)), liability);
+        assertEq(totalPaid + liability, funded);
     }
 
     function testPermanentBurnDevelopmentSurvivesTransfer() public {
