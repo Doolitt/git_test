@@ -1,12 +1,6 @@
 name: FLOWER Foundry CI
 
 on:
-  push:
-    branches:
-      - flower-foundry-ci
-  pull_request:
-    branches:
-      - master
   workflow_dispatch:
 
 permissions:
