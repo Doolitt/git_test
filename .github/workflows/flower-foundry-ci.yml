@@ -12,8 +12,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,11 +53,3 @@ jobs:
       - name: Gas snapshot
         working-directory: flower
         run: forge snapshot
-
-      - name: Upload test project on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: flower-foundry-failure-project
-          path: flower
-          retention-days: 7
