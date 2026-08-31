@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {ActivationManager} from "../src/ActivationManager.sol";
+import {ActivationManager, IFLOWER} from "../src/ActivationManager.sol";
 import {FLOWER} from "../src/FLOWER.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 
@@ -16,7 +16,7 @@ contract CurveMathTest is Test {
     function setUp() public {
         FLOWER flower = new FLOWER(address(this));
         MockNFT nft = new MockNFT();
-        manager = new ActivationManager(address(this), nft, flower);
+        manager = new ActivationManager(address(this), nft, IFLOWER(address(flower)));
     }
 
     function testBelowFloorHasZeroWeight() public view {
