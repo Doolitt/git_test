@@ -17,11 +17,12 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant WAD = 1e18;
+    uint256 public constant MAX_CLAIM_BATCH = 100;
 
-    IERC20 public immutable rewardToken;
-    IERC721 public immutable nft;
-    IWeightProvider public immutable weightProvider;
-    address public immutable activationManager;
+    IERC20 public immutable REWARD_TOKEN;
+    IERC721 public immutable NFT;
+    IWeightProvider public immutable WEIGHT_PROVIDER;
+    address public immutable ACTIVATION_MANAGER;
 
     uint256 public accRewardPerWeight;
     uint256 public totalFunded;
@@ -34,6 +35,9 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
     error NoActiveWeight();
     error InvalidAmount();
     error NotNFTOwner();
+    error ZeroAddress();
+    error UnsupportedRewardToken();
+    error ClaimBatchTooLarge();
 
     event RewardsFunded(address indexed funder, uint256 amount, uint256 totalWeight, uint256 newAccumulator);
     event TokenCheckpointed(uint256 indexed tokenId, address indexed beneficiary, uint256 weight, uint256 accrued);
@@ -45,19 +49,28 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
         IWeightProvider weightProvider_,
         address activationManager_
     ) {
-        rewardToken = rewardToken_;
-        nft = nft_;
-        weightProvider = weightProvider_;
-        activationManager = activationManager_;
+        if (
+            address(rewardToken_) == address(0) || address(nft_) == address(0)
+                || address(weightProvider_) == address(0) || activationManager_ == address(0)
+        ) revert ZeroAddress();
+
+        REWARD_TOKEN = rewardToken_;
+        NFT = nft_;
+        WEIGHT_PROVIDER = weightProvider_;
+        ACTIVATION_MANAGER = activationManager_;
     }
 
     function fund(uint256 amount) external nonReentrant {
         if (amount == 0) revert InvalidAmount();
 
-        uint256 networkWeight = weightProvider.totalWeight();
+        uint256 networkWeight = WEIGHT_PROVIDER.totalWeight();
         if (networkWeight == 0) revert NoActiveWeight();
 
-        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 balanceBefore = REWARD_TOKEN.balanceOf(address(this));
+        REWARD_TOKEN.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = REWARD_TOKEN.balanceOf(address(this)) - balanceBefore;
+        if (received != amount) revert UnsupportedRewardToken();
+
         accRewardPerWeight += (amount * WAD) / networkWeight;
         totalFunded += amount;
 
@@ -70,17 +83,19 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
         uint256 oldWeight,
         uint256
     ) external override {
-        if (msg.sender != activationManager) revert NotActivationManager();
+        if (msg.sender != ACTIVATION_MANAGER) revert NotActivationManager();
         _settle(tokenId, beneficiary, oldWeight);
         tokenAccPaid[tokenId] = accRewardPerWeight;
     }
 
     function claim(uint256[] calldata tokenIds) external nonReentrant {
-        for (uint256 i; i < tokenIds.length; ++i) {
-            uint256 tokenId = tokenIds[i];
-            if (nft.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
+        if (tokenIds.length > MAX_CLAIM_BATCH) revert ClaimBatchTooLarge();
 
-            uint256 currentWeight = weightProvider.weightOf(tokenId);
+        for (uint256 i = 0; i < tokenIds.length; ++i) {
+            uint256 tokenId = tokenIds[i];
+            if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
+
+            uint256 currentWeight = WEIGHT_PROVIDER.weightOf(tokenId);
             _settle(tokenId, msg.sender, currentWeight);
             tokenAccPaid[tokenId] = accRewardPerWeight;
         }
@@ -93,7 +108,7 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
     }
 
     function pending(uint256 tokenId) external view returns (uint256) {
-        uint256 currentWeight = weightProvider.weightOf(tokenId);
+        uint256 currentWeight = WEIGHT_PROVIDER.weightOf(tokenId);
         uint256 delta = accRewardPerWeight - tokenAccPaid[tokenId];
         return (currentWeight * delta) / WAD;
     }
@@ -101,9 +116,7 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
     function _settle(uint256 tokenId, address beneficiary, uint256 weight) internal {
         uint256 delta = accRewardPerWeight - tokenAccPaid[tokenId];
         uint256 accrued = (weight * delta) / WAD;
-        if (accrued != 0) {
-            claimable[beneficiary] += accrued;
-        }
+        if (accrued != 0) claimable[beneficiary] += accrued;
         emit TokenCheckpointed(tokenId, beneficiary, weight, accrued);
     }
 
@@ -113,8 +126,8 @@ contract RewardDistributor is IRewardDistributor, ReentrancyGuard {
 
         claimable[beneficiary] = 0;
         totalClaimed += amount;
-        rewardToken.safeTransfer(beneficiary, amount);
-
         emit Claimed(beneficiary, amount);
+
+        REWARD_TOKEN.safeTransfer(beneficiary, amount);
     }
 }
