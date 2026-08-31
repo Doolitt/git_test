@@ -8,12 +8,13 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IActivationTransferHook} from "./interfaces/IActivationTransferHook.sol";
+import {IFlowerNFTActivationStatus} from "./interfaces/IFlowerNFTActivationStatus.sol";
 
 /// @title FlowerNFT
 /// @notice 7,777-unit FLOWER NFT collection.
 /// @dev Public mint is paid directly to the protocol treasury in the quote token.
 ///      There is intentionally no wallet ownership cap.
-contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
+contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard, IFlowerNFTActivationStatus {
     using SafeERC20 for IERC20;
 
     uint256 public constant MAX_SUPPLY = 7_777;
@@ -33,7 +34,7 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     bool public reserveMintingFinalized;
     bool public metadataFrozen;
     string private _baseTokenUri;
-    IActivationTransferHook public activationHook;
+    IActivationTransferHook public override activationHook;
 
     error SaleClosed();
     error InvalidQuantity();
@@ -56,13 +57,10 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
     event PublicMint(address indexed buyer, uint256 quantity, uint256 cost, uint256 firstTokenId);
     event ReserveMint(address indexed to, uint256 quantity, uint256 firstTokenId);
 
-    constructor(
-        address initialOwner,
-        IERC20 quoteToken_,
-        address treasury_,
-        uint256 mintPrice_,
-        string memory baseUri_
-    ) ERC721("FLOWER", "FLOWER-NFT") Ownable(initialOwner) {
+    constructor(address initialOwner, IERC20 quoteToken_, address treasury_, uint256 mintPrice_, string memory baseUri_)
+        ERC721("FLOWER", "FLOWER-NFT")
+        Ownable(initialOwner)
+    {
         if (address(quoteToken_) == address(0) || treasury_ == address(0)) revert ZeroAddress();
         if (mintPrice_ == 0) revert InvalidMintPrice();
 
@@ -85,6 +83,8 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
         emit PublicMint(msg.sender, quantity, cost, firstTokenId);
 
         QUOTE_TOKEN.safeTransferFrom(msg.sender, TREASURY, cost);
+        // Exact settlement is intentional: fee-on-transfer quote assets are unsupported.
+        // forge-lint: disable-next-line(incorrect-strict-equality)
         if (QUOTE_TOKEN.balanceOf(TREASURY) - treasuryBalanceBefore != cost) {
             revert UnsupportedQuoteToken();
         }
@@ -160,17 +160,10 @@ contract FlowerNFT is ERC721, Ownable2Step, ReentrancyGuard {
 
     /// @dev OpenZeppelin 5.x transfer hook. A true ownership change resets temporary
     ///      activation. A self-transfer does not detach an otherwise valid lock.
-    function _update(address to, uint256 tokenId, address auth)
-        internal
-        override
-        returns (address from)
-    {
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address from) {
         from = super._update(to, tokenId, auth);
 
-        if (
-            from != address(0) && to != address(0) && from != to
-                && address(activationHook) != address(0)
-        ) {
+        if (from != address(0) && to != address(0) && from != to && address(activationHook) != address(0)) {
             activationHook.onNftTransfer(tokenId, from, to);
         }
     }
