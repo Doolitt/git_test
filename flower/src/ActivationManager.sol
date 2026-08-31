@@ -14,6 +14,7 @@ import {IActivationTransferHook} from "./interfaces/IActivationTransferHook.sol"
 import {IFlowerNFTActivationStatus} from "./interfaces/IFlowerNFTActivationStatus.sol";
 import {IWeightProvider} from "./interfaces/IWeightProvider.sol";
 import {IRewardDistributor} from "./interfaces/IRewardDistributor.sol";
+import {IRewardDistributorStatus} from "./interfaces/IRewardDistributorStatus.sol";
 import {IFLOWER} from "./interfaces/IFLOWER.sol";
 
 /// @title ActivationManager
@@ -36,7 +37,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     uint256 public constant HILL_MAX_BOOST = 2.75e18;
     uint256 public constant TAIL_COEFFICIENT = 0.15e18;
     uint256 public constant TAIL_SCALE = 1_000_000_000 ether;
-    uint256 public constant BURN_COEFFICIENT = 0.30e18;
+    uint256 public constant BURN_COEFFICIENT = 0.3e18;
     uint256 public constant BURN_SCALE = 20_000_000 ether;
 
     IERC721 public immutable NFT;
@@ -96,38 +97,22 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         uint256 weight
     );
     event LockIncreased(
-        uint256 indexed tokenId,
-        uint256 added,
-        uint256 newLocked,
-        uint64 newUnlockAt,
-        uint256 newWeight
+        uint256 indexed tokenId, uint256 added, uint256 newLocked, uint64 newUnlockAt, uint256 newWeight
     );
     event DurationExtended(
-        uint256 indexed tokenId,
-        uint16 oldDurationDays,
-        uint16 newDurationDays,
-        uint64 newUnlockAt,
-        uint256 newWeight
+        uint256 indexed tokenId, uint16 oldDurationDays, uint16 newDurationDays, uint64 newUnlockAt, uint256 newWeight
     );
     event PermanentBurn(
-        uint256 indexed tokenId,
-        address indexed owner,
-        uint256 burned,
-        uint256 cumulativeBurn,
-        uint256 newWeight
+        uint256 indexed tokenId, address indexed owner, uint256 burned, uint256 cumulativeBurn, uint256 newWeight
     );
     event PositionWithdrawn(uint256 indexed tokenId, address indexed activator, uint256 amount);
     event PositionDetached(
-        uint256 indexed tokenId,
-        uint256 indexed detachedId,
-        address indexed activator,
-        uint256 amount,
-        uint64 unlockAt
+        uint256 indexed tokenId, uint256 indexed detachedId, address indexed activator, uint256 amount, uint64 unlockAt
     );
     event DetachedLockClaimed(uint256 indexed detachedId, address indexed beneficiary, uint256 amount);
 
     modifier whenActivationEnabled() {
-        if (!activationEnabled) revert ActivationNotEnabled();
+        _requireActivationEnabled();
         _;
     }
 
@@ -141,6 +126,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         if (address(rewardDistributor) != address(0)) revert RewardDistributorAlreadySet();
         if (address(distributor) == address(0)) revert ZeroAddress();
         if (address(distributor).code.length == 0) revert InvalidRewardDistributor();
+        _validateRewardDistributor(address(distributor));
         rewardDistributor = distributor;
         emit RewardDistributorSet(address(distributor));
     }
@@ -151,8 +137,9 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         if (activationEnabled) revert ActivationAlreadyEnabled();
         if (address(rewardDistributor) == address(0)) revert RewardDistributorNotSet();
 
-        address installedHook = IFlowerNFTActivationStatus(address(NFT)).activationHook();
+        address installedHook = address(IFlowerNFTActivationStatus(address(NFT)).activationHook());
         if (installedHook != address(this)) revert HookNotInstalled();
+        _validateRewardDistributor(address(rewardDistributor));
 
         activationEnabled = true;
         emit ActivationEnabled(installedHook, address(rewardDistributor));
@@ -172,11 +159,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         uint256 newWeight = computeWeight(lockAmount, permanentBurned[tokenId], durationDays);
 
         positions[tokenId] = Position({
-            activator: msg.sender,
-            locked: storedLock,
-            unlockAt: unlockAt,
-            durationDays: durationDays,
-            weight: newWeight
+            activator: msg.sender, locked: storedLock, unlockAt: unlockAt, durationDays: durationDays, weight: newWeight
         });
         totalWeight += newWeight;
 
@@ -188,11 +171,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
     /// @notice Adds FLOWER to an active position and renews the full selected commitment period.
     /// @dev A unified position is used instead of tranches: topping up extends the unlock date for all locked FLOWER.
-    function increaseLock(uint256 tokenId, uint256 additionalAmount)
-        external
-        nonReentrant
-        whenActivationEnabled
-    {
+    function increaseLock(uint256 tokenId, uint256 additionalAmount) external nonReentrant whenActivationEnabled {
         if (additionalAmount == 0) revert InvalidAmount();
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
@@ -218,11 +197,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
     /// @notice Moves an active position to a strictly longer supported duration.
     /// @dev The new duration runs in full from the extension transaction.
-    function extendDuration(uint256 tokenId, uint16 newDurationDays)
-        external
-        nonReentrant
-        whenActivationEnabled
-    {
+    function extendDuration(uint256 tokenId, uint16 newDurationDays) external nonReentrant whenActivationEnabled {
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
         Position storage p = positions[tokenId];
@@ -246,11 +221,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         _notifyWeightChange(tokenId, msg.sender, oldWeight, newWeight);
     }
 
-    function burnForDevelopment(uint256 tokenId, uint256 amount)
-        external
-        nonReentrant
-        whenActivationEnabled
-    {
+    function burnForDevelopment(uint256 tokenId, uint256 amount) external nonReentrant whenActivationEnabled {
         if (amount == 0) revert InvalidAmount();
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
@@ -281,6 +252,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         Position memory p = positions[tokenId];
         if (p.activator == address(0)) revert NoPosition();
         if (p.activator != msg.sender) revert NotActivator();
+        // Validator timestamp skew is immaterial relative to 90+ day commitments.
+        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.unlockAt) revert LockStillCommitted();
 
         delete positions[tokenId];
@@ -303,12 +276,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         totalWeight -= p.weight;
 
         uint256 detachedId = nextDetachedLockId++;
-        detachedLocks[detachedId] = DetachedLock({
-            beneficiary: from,
-            amount: p.locked,
-            unlockAt: p.unlockAt,
-            claimed: false
-        });
+        detachedLocks[detachedId] =
+            DetachedLock({beneficiary: from, amount: p.locked, unlockAt: p.unlockAt, claimed: false});
 
         emit PositionDetached(tokenId, detachedId, from, uint256(p.locked), p.unlockAt);
         _notifyWeightChange(tokenId, from, p.weight, 0);
@@ -317,6 +286,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     function claimDetachedLock(uint256 detachedId) external nonReentrant {
         DetachedLock storage d = detachedLocks[detachedId];
         if (d.beneficiary != msg.sender || d.claimed || d.amount == 0) revert DetachedLockUnavailable();
+        // Validator timestamp skew is immaterial relative to 90+ day commitments.
+        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < d.unlockAt) revert LockStillCommitted();
 
         d.claimed = true;
@@ -330,11 +301,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         return positions[tokenId].weight;
     }
 
-    function computeWeight(uint256 lockAmount, uint256 burnAmount, uint16 durationDays)
-        public
-        pure
-        returns (uint256)
-    {
+    function computeWeight(uint256 lockAmount, uint256 burnAmount, uint16 durationDays) public pure returns (uint256) {
         if (lockAmount < ACTIVATION_FLOOR) return 0;
 
         uint256 durationMultiplier = _durationMultiplier(durationDays);
@@ -365,16 +332,28 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     }
 
     function _durationMultiplier(uint16 durationDays) internal pure returns (uint256) {
-        if (durationDays == 90) return 1.00e18;
-        if (durationDays == 180) return 1.10e18;
+        if (durationDays == 90) return 1.0e18;
+        if (durationDays == 180) return 1.1e18;
         if (durationDays == 365) return 1.25e18;
-        if (durationDays == 730) return 1.40e18;
+        if (durationDays == 730) return 1.4e18;
         revert InvalidDuration();
     }
 
     function _unlockTimestamp(uint16 durationDays) internal view returns (uint64) {
         _durationMultiplier(durationDays);
         return (block.timestamp + uint256(durationDays) * 1 days).toUint64();
+    }
+
+    function _requireActivationEnabled() internal view {
+        if (!activationEnabled) revert ActivationNotEnabled();
+    }
+
+    function _validateRewardDistributor(address distributor) internal view {
+        IRewardDistributorStatus status = IRewardDistributorStatus(distributor);
+        if (
+            status.ACTIVATION_MANAGER() != address(this) || status.WEIGHT_PROVIDER() != address(this)
+                || status.NFT() != address(NFT)
+        ) revert InvalidRewardDistributor();
     }
 
     function _replaceTotalWeight(uint256 oldWeight, uint256 newWeight) internal {
@@ -385,12 +364,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         }
     }
 
-    function _notifyWeightChange(
-        uint256 tokenId,
-        address beneficiary,
-        uint256 oldWeight,
-        uint256 newWeight
-    ) internal {
+    function _notifyWeightChange(uint256 tokenId, address beneficiary, uint256 oldWeight, uint256 newWeight) internal {
         IRewardDistributor distributor = rewardDistributor;
         if (address(distributor) != address(0)) {
             distributor.onWeightChange(tokenId, beneficiary, oldWeight, newWeight);
