@@ -18,27 +18,35 @@ import {IRewardDistributorStatus} from "./interfaces/IRewardDistributorStatus.so
 import {IFLOWER} from "./interfaces/IFLOWER.sol";
 
 /// @title ActivationManager
-/// @notice Escrows temporary FLOWER locks and tracks permanent FLOWER burns by NFT.
+/// @notice Escrows temporary FLOWER locks, tracks permanent FLOWER burns by NFT,
+///         and supports bounded non-retroactive economic-scale epochs.
 /// @dev Reward weights use 18-decimal fixed point (1e18 == 1.0 weight).
-///
-/// IMPORTANT DURATION SEMANTICS IN THIS REFERENCE IMPLEMENTATION:
-/// The selected duration is a MINIMUM lock commitment. The position keeps earning
-/// its selected multiplier after the minimum period until the activator withdraws
-/// or transfers the NFT. Increasing a lock renews the full selected commitment period.
 contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
 
     uint256 public constant WAD = 1e18;
+
     uint256 public constant ACTIVATION_FLOOR = 50_000_000 ether;
-    uint256 public constant BASE_WEIGHT = 0.25e18;
     uint256 public constant HILL_MIDPOINT = 300_000_000 ether;
+    uint256 public constant TAIL_SCALE = 1_000_000_000 ether;
+    uint256 public constant BURN_SCALE = 20_000_000 ether;
+
+    uint256 public constant BASE_WEIGHT = 0.20e18;
     uint256 public constant HILL_POWER = 2.25e18;
     uint256 public constant HILL_MAX_BOOST = 2.75e18;
     uint256 public constant TAIL_COEFFICIENT = 0.15e18;
-    uint256 public constant TAIL_SCALE = 1_000_000_000 ether;
-    uint256 public constant BURN_COEFFICIENT = 0.3e18;
-    uint256 public constant BURN_SCALE = 20_000_000 ether;
+    uint256 public constant BURN_COEFFICIENT = 0.80e18;
+    uint256 public constant BURN_GATE_FLOOR = 0.10e18;
+    uint256 public constant BURN_GATE_HILL_SHARE = 0.90e18;
+
+    uint256 public constant MIN_ECONOMIC_SCALE = 0.05e18;
+    uint256 public constant MAX_ECONOMIC_SCALE = 2.00e18;
+    uint256 public constant MAX_SCALE_STEP_BPS = 2_500;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant SCALE_TIMELOCK = 7 days;
+    uint256 public constant MIN_EPOCH_INTERVAL = 30 days;
+    uint256 public constant SCALE_ENABLEMENT_DELAY = 30 days;
 
     IERC721 public immutable NFT;
     IFLOWER public immutable FLOWER_TOKEN;
@@ -47,6 +55,11 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     bool public activationEnabled;
     uint256 public override totalWeight;
     uint256 public nextDetachedLockId = 1;
+
+    uint32 public currentEpochId;
+    bool public economicScaleUpdatesEnabled;
+    bool public economicScaleUpdatesPermanentlyDisabled;
+    uint64 public scaleEnablementExecutableAt;
 
     struct Position {
         address activator;
@@ -63,9 +76,23 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         bool claimed;
     }
 
+    struct EconomicEpoch {
+        uint64 activatedAt;
+        uint64 scaleWad;
+    }
+
+    struct PendingEconomicScale {
+        uint64 executableAt;
+        uint64 scaleWad;
+        bool exists;
+    }
+
     mapping(uint256 tokenId => Position) public positions;
+    mapping(uint256 tokenId => uint32 epochId) public positionEpoch;
     mapping(uint256 tokenId => uint256 amount) public permanentBurned;
     mapping(uint256 detachedId => DetachedLock) public detachedLocks;
+    mapping(uint32 epochId => EconomicEpoch) public economicEpochs;
+    PendingEconomicScale public pendingEconomicScale;
 
     error NotNFTOwner();
     error PositionExists();
@@ -85,6 +112,18 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     error HookNotInstalled();
     error ZeroAddress();
     error DetachedLockUnavailable();
+    error EconomicScaleUpdatesDisabled();
+    error EconomicScaleUpdatesFrozen();
+    error EconomicScaleEnablementAlreadyScheduled();
+    error EconomicScaleEnablementNotReady();
+    error InvalidEconomicScale();
+    error EconomicScaleStepTooLarge();
+    error EconomicEpochTooSoon();
+    error EconomicScaleProposalPending();
+    error NoEconomicScaleProposal();
+    error EconomicScaleProposalNotReady();
+    error EconomicScaleUnchanged();
+    error InvalidEpoch();
 
     event RewardDistributorSet(address indexed distributor);
     event ActivationEnabled(address indexed activationHook, address indexed rewardDistributor);
@@ -96,6 +135,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         uint64 unlockAt,
         uint256 weight
     );
+    event PositionEpochAssigned(uint256 indexed tokenId, uint32 indexed epochId);
     event LockIncreased(
         uint256 indexed tokenId, uint256 added, uint256 newLocked, uint64 newUnlockAt, uint256 newWeight
     );
@@ -110,6 +150,19 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         uint256 indexed tokenId, uint256 indexed detachedId, address indexed activator, uint256 amount, uint64 unlockAt
     );
     event DetachedLockClaimed(uint256 indexed detachedId, address indexed beneficiary, uint256 amount);
+    event EconomicScaleEnablementScheduled(uint64 executableAt);
+    event EconomicScaleUpdatesEnabled();
+    event EconomicScaleProposed(
+        uint32 indexed nextEpochId,
+        uint256 indexed currentScale,
+        uint256 proposedScale,
+        uint64 executableAt
+    );
+    event EconomicScaleProposalCancelled(uint256 proposedScale);
+    event EconomicEpochActivated(
+        uint32 indexed epochId, uint256 previousScale, uint256 newScale, uint64 activatedAt
+    );
+    event EconomicScaleUpdatesPermanentlyDisabled(uint32 indexed finalEpochId, uint256 finalScale);
 
     modifier whenActivationEnabled() {
         _requireActivationEnabled();
@@ -120,6 +173,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         if (address(nft_) == address(0) || address(flower_) == address(0)) revert ZeroAddress();
         NFT = nft_;
         FLOWER_TOKEN = flower_;
+        economicEpochs[0] = EconomicEpoch({activatedAt: block.timestamp.toUint64(), scaleWad: WAD.toUint64()});
     }
 
     function setRewardDistributor(IRewardDistributor distributor) external onlyOwner {
@@ -131,8 +185,6 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         emit RewardDistributorSet(address(distributor));
     }
 
-    /// @notice One-way switch that opens economic activation after the NFT transfer hook
-    ///         and reward distributor are both permanently wired.
     function enableActivation() external onlyOwner {
         if (activationEnabled) revert ActivationAlreadyEnabled();
         if (address(rewardDistributor) == address(0)) revert RewardDistributorNotSet();
@@ -145,6 +197,98 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         emit ActivationEnabled(installedHook, address(rewardDistributor));
     }
 
+    function scheduleEconomicScaleEnablement() external onlyOwner {
+        if (economicScaleUpdatesPermanentlyDisabled) revert EconomicScaleUpdatesFrozen();
+        if (economicScaleUpdatesEnabled || scaleEnablementExecutableAt != 0) {
+            revert EconomicScaleEnablementAlreadyScheduled();
+        }
+
+        uint64 executableAt = (block.timestamp + SCALE_ENABLEMENT_DELAY).toUint64();
+        scaleEnablementExecutableAt = executableAt;
+        emit EconomicScaleEnablementScheduled(executableAt);
+    }
+
+    function enableEconomicScaleUpdates() external {
+        if (economicScaleUpdatesPermanentlyDisabled) revert EconomicScaleUpdatesFrozen();
+        if (economicScaleUpdatesEnabled) revert EconomicScaleEnablementAlreadyScheduled();
+
+        uint64 executableAt = scaleEnablementExecutableAt;
+        if (executableAt == 0 || block.timestamp < executableAt) revert EconomicScaleEnablementNotReady();
+
+        scaleEnablementExecutableAt = 0;
+        economicScaleUpdatesEnabled = true;
+        emit EconomicScaleUpdatesEnabled();
+    }
+
+    function proposeEconomicScale(uint256 newScaleWad) external onlyOwner {
+        if (economicScaleUpdatesPermanentlyDisabled) revert EconomicScaleUpdatesFrozen();
+        if (!economicScaleUpdatesEnabled) revert EconomicScaleUpdatesDisabled();
+        if (pendingEconomicScale.exists) revert EconomicScaleProposalPending();
+        if (newScaleWad < MIN_ECONOMIC_SCALE || newScaleWad > MAX_ECONOMIC_SCALE) revert InvalidEconomicScale();
+
+        EconomicEpoch memory current = economicEpochs[currentEpochId];
+        uint256 currentScale = uint256(current.scaleWad);
+        if (newScaleWad == currentScale) revert EconomicScaleUnchanged();
+        if (block.timestamp < uint256(current.activatedAt) + MIN_EPOCH_INTERVAL) revert EconomicEpochTooSoon();
+
+        uint256 delta = newScaleWad > currentScale ? newScaleWad - currentScale : currentScale - newScaleWad;
+        if (delta * BPS_DENOMINATOR > currentScale * MAX_SCALE_STEP_BPS) revert EconomicScaleStepTooLarge();
+
+        uint64 executableAt = (block.timestamp + SCALE_TIMELOCK).toUint64();
+        pendingEconomicScale = PendingEconomicScale({
+            executableAt: executableAt,
+            scaleWad: newScaleWad.toUint64(),
+            exists: true
+        });
+
+        emit EconomicScaleProposed(currentEpochId + 1, currentScale, newScaleWad, executableAt);
+    }
+
+    function cancelPendingEconomicScale() external onlyOwner {
+        PendingEconomicScale memory pending = pendingEconomicScale;
+        if (!pending.exists) revert NoEconomicScaleProposal();
+
+        delete pendingEconomicScale;
+        emit EconomicScaleProposalCancelled(uint256(pending.scaleWad));
+    }
+
+    function executeEconomicScale() external {
+        if (economicScaleUpdatesPermanentlyDisabled) revert EconomicScaleUpdatesFrozen();
+        if (!economicScaleUpdatesEnabled) revert EconomicScaleUpdatesDisabled();
+
+        PendingEconomicScale memory pending = pendingEconomicScale;
+        if (!pending.exists) revert NoEconomicScaleProposal();
+        if (block.timestamp < pending.executableAt) revert EconomicScaleProposalNotReady();
+
+        EconomicEpoch memory current = economicEpochs[currentEpochId];
+        if (block.timestamp < uint256(current.activatedAt) + MIN_EPOCH_INTERVAL) revert EconomicEpochTooSoon();
+
+        uint32 newEpochId = currentEpochId + 1;
+        uint64 activatedAt = block.timestamp.toUint64();
+        currentEpochId = newEpochId;
+        economicEpochs[newEpochId] = EconomicEpoch({activatedAt: activatedAt, scaleWad: pending.scaleWad});
+        delete pendingEconomicScale;
+
+        emit EconomicEpochActivated(newEpochId, uint256(current.scaleWad), uint256(pending.scaleWad), activatedAt);
+    }
+
+    function permanentlyDisableEconomicScaleUpdates() external onlyOwner {
+        if (economicScaleUpdatesPermanentlyDisabled) revert EconomicScaleUpdatesFrozen();
+
+        if (pendingEconomicScale.exists) {
+            emit EconomicScaleProposalCancelled(uint256(pendingEconomicScale.scaleWad));
+            delete pendingEconomicScale;
+        }
+
+        economicScaleUpdatesEnabled = false;
+        scaleEnablementExecutableAt = 0;
+        economicScaleUpdatesPermanentlyDisabled = true;
+
+        emit EconomicScaleUpdatesPermanentlyDisabled(
+            currentEpochId, uint256(economicEpochs[currentEpochId].scaleWad)
+        );
+    }
+
     function activate(uint256 tokenId, uint256 lockAmount, uint16 durationDays)
         external
         nonReentrant
@@ -152,25 +296,31 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     {
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
         if (positions[tokenId].activator != address(0)) revert PositionExists();
-        if (lockAmount < ACTIVATION_FLOOR) revert BelowActivationFloor();
+
+        uint32 epochId = currentEpochId;
+        if (lockAmount < activationFloorAtEpoch(epochId)) revert BelowActivationFloor();
 
         uint128 storedLock = lockAmount.toUint128();
         uint64 unlockAt = _unlockTimestamp(durationDays);
-        uint256 newWeight = computeWeight(lockAmount, permanentBurned[tokenId], durationDays);
+        uint256 newWeight = computeWeightAtEpoch(epochId, lockAmount, permanentBurned[tokenId], durationDays);
 
         positions[tokenId] = Position({
-            activator: msg.sender, locked: storedLock, unlockAt: unlockAt, durationDays: durationDays, weight: newWeight
+            activator: msg.sender,
+            locked: storedLock,
+            unlockAt: unlockAt,
+            durationDays: durationDays,
+            weight: newWeight
         });
+        positionEpoch[tokenId] = epochId;
         totalWeight += newWeight;
 
         emit Activated(tokenId, msg.sender, lockAmount, durationDays, unlockAt, newWeight);
+        emit PositionEpochAssigned(tokenId, epochId);
         _notifyWeightChange(tokenId, msg.sender, 0, newWeight);
 
         IERC20(address(FLOWER_TOKEN)).safeTransferFrom(msg.sender, address(this), lockAmount);
     }
 
-    /// @notice Adds FLOWER to an active position and renews the full selected commitment period.
-    /// @dev A unified position is used instead of tranches: topping up extends the unlock date for all locked FLOWER.
     function increaseLock(uint256 tokenId, uint256 additionalAmount) external nonReentrant whenActivationEnabled {
         if (additionalAmount == 0) revert InvalidAmount();
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
@@ -182,7 +332,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         uint256 oldWeight = p.weight;
         uint256 newLocked = uint256(p.locked) + additionalAmount;
         uint64 newUnlockAt = _unlockTimestamp(p.durationDays);
-        uint256 newWeight = computeWeight(newLocked, permanentBurned[tokenId], p.durationDays);
+        uint32 epochId = positionEpoch[tokenId];
+        uint256 newWeight = computeWeightAtEpoch(epochId, newLocked, permanentBurned[tokenId], p.durationDays);
 
         p.locked = newLocked.toUint128();
         p.unlockAt = newUnlockAt;
@@ -195,8 +346,6 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         IERC20(address(FLOWER_TOKEN)).safeTransferFrom(msg.sender, address(this), additionalAmount);
     }
 
-    /// @notice Moves an active position to a strictly longer supported duration.
-    /// @dev The new duration runs in full from the extension transaction.
     function extendDuration(uint256 tokenId, uint16 newDurationDays) external nonReentrant whenActivationEnabled {
         if (NFT.ownerOf(tokenId) != msg.sender) revert NotNFTOwner();
 
@@ -210,7 +359,9 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
         uint256 oldWeight = p.weight;
         uint64 newUnlockAt = _unlockTimestamp(newDurationDays);
-        uint256 newWeight = computeWeight(uint256(p.locked), permanentBurned[tokenId], newDurationDays);
+        uint32 epochId = positionEpoch[tokenId];
+        uint256 newWeight =
+            computeWeightAtEpoch(epochId, uint256(p.locked), permanentBurned[tokenId], newDurationDays);
 
         p.durationDays = newDurationDays;
         p.unlockAt = newUnlockAt;
@@ -234,7 +385,8 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
 
         if (p.activator != address(0)) {
             oldWeight = p.weight;
-            newWeight = computeWeight(uint256(p.locked), cumulativeBurn, p.durationDays);
+            uint32 epochId = positionEpoch[tokenId];
+            newWeight = computeWeightAtEpoch(epochId, uint256(p.locked), cumulativeBurn, p.durationDays);
             p.weight = newWeight;
             _replaceTotalWeight(oldWeight, newWeight);
         }
@@ -252,11 +404,10 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         Position memory p = positions[tokenId];
         if (p.activator == address(0)) revert NoPosition();
         if (p.activator != msg.sender) revert NotActivator();
-        // Validator timestamp skew is immaterial relative to 90+ day commitments.
-        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.unlockAt) revert LockStillCommitted();
 
         delete positions[tokenId];
+        delete positionEpoch[tokenId];
         totalWeight -= p.weight;
 
         emit PositionWithdrawn(tokenId, msg.sender, uint256(p.locked));
@@ -273,6 +424,7 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         if (p.activator != from) revert NotActivator();
 
         delete positions[tokenId];
+        delete positionEpoch[tokenId];
         totalWeight -= p.weight;
 
         uint256 detachedId = nextDetachedLockId++;
@@ -286,8 +438,6 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
     function claimDetachedLock(uint256 detachedId) external nonReentrant {
         DetachedLock storage d = detachedLocks[detachedId];
         if (d.beneficiary != msg.sender || d.claimed || d.amount == 0) revert DetachedLockUnavailable();
-        // Validator timestamp skew is immaterial relative to 90+ day commitments.
-        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < d.unlockAt) revert LockStillCommitted();
 
         d.claimed = true;
@@ -301,34 +451,78 @@ contract ActivationManager is IActivationTransferHook, IWeightProvider, Ownable2
         return positions[tokenId].weight;
     }
 
-    function computeWeight(uint256 lockAmount, uint256 burnAmount, uint16 durationDays) public pure returns (uint256) {
-        if (lockAmount < ACTIVATION_FLOOR) return 0;
+    function computeWeight(uint256 lockAmount, uint256 burnAmount, uint16 durationDays) public view returns (uint256) {
+        return computeWeightAtEpoch(currentEpochId, lockAmount, burnAmount, durationDays);
+    }
+
+    function computeWeightAtEpoch(uint32 epochId, uint256 lockAmount, uint256 burnAmount, uint16 durationDays)
+        public
+        view
+        returns (uint256)
+    {
+        if (epochId > currentEpochId) revert InvalidEpoch();
+
+        uint256 scaleWad = uint256(economicEpochs[epochId].scaleWad);
+        if (scaleWad == 0) revert InvalidEpoch();
+
+        uint256 floor = _scaleAmount(ACTIVATION_FLOOR, scaleWad);
+        if (lockAmount < floor) return 0;
 
         uint256 durationMultiplier = _durationMultiplier(durationDays);
-        uint256 lockBoost = _lockBoost(lockAmount - ACTIVATION_FLOOR, durationMultiplier);
-        uint256 burnBoost = _burnBoost(burnAmount);
+        uint256 midpoint = _scaleAmount(HILL_MIDPOINT, scaleWad);
+        uint256 tailScale = _scaleAmount(TAIL_SCALE, scaleWad);
+        uint256 burnScale = _scaleAmount(BURN_SCALE, scaleWad);
+        uint256 x = lockAmount - floor;
+
+        uint256 hill = _hillFraction(x, midpoint);
+        uint256 lockBoost = _lockBoost(x, durationMultiplier, hill, tailScale);
+        uint256 burnBoost = _burnBoost(burnAmount, burnScale, hill);
 
         return BASE_WEIGHT + lockBoost + burnBoost;
     }
 
-    function _lockBoost(uint256 x, uint256 durationMultiplier) internal pure returns (uint256) {
+    function activationFloorAtEpoch(uint32 epochId) public view returns (uint256) {
+        if (epochId > currentEpochId) revert InvalidEpoch();
+        uint256 scaleWad = uint256(economicEpochs[epochId].scaleWad);
+        if (scaleWad == 0) revert InvalidEpoch();
+        return _scaleAmount(ACTIVATION_FLOOR, scaleWad);
+    }
+
+    function currentActivationFloor() external view returns (uint256) {
+        return activationFloorAtEpoch(currentEpochId);
+    }
+
+    function _hillFraction(uint256 x, uint256 midpoint) internal pure returns (uint256) {
         if (x == 0) return 0;
 
-        UD60x18 xFp = ud(x);
-        UD60x18 xPow = xFp.pow(ud(HILL_POWER));
-        UD60x18 kPow = ud(HILL_MIDPOINT).pow(ud(HILL_POWER));
+        UD60x18 xPow = ud(x).pow(ud(HILL_POWER));
+        UD60x18 kPow = ud(midpoint).pow(ud(HILL_POWER));
+        return xPow.div(xPow + kPow).unwrap();
+    }
 
-        UD60x18 core = ud(HILL_MAX_BOOST).mul(xPow.div(xPow + kPow));
-        UD60x18 tail = ud(TAIL_COEFFICIENT).mul((ud(WAD) + xFp.div(ud(TAIL_SCALE))).ln());
+    function _lockBoost(uint256 x, uint256 durationMultiplier, uint256 hill, uint256 tailScale)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (x == 0) return 0;
 
+        UD60x18 core = ud(HILL_MAX_BOOST).mul(ud(hill));
+        UD60x18 tail = ud(TAIL_COEFFICIENT).mul((ud(WAD) + ud(x).div(ud(tailScale))).ln());
         return (core + tail).mul(ud(durationMultiplier)).unwrap();
     }
 
-    function _burnBoost(uint256 burnAmount) internal pure returns (uint256) {
+    function _burnBoost(uint256 burnAmount, uint256 burnScale, uint256 hill) internal pure returns (uint256) {
         if (burnAmount == 0) return 0;
 
-        UD60x18 burnRatio = ud(burnAmount).div(ud(BURN_SCALE));
-        return ud(BURN_COEFFICIENT).mul((ud(WAD) + burnRatio).ln()).unwrap();
+        uint256 burnGate = BURN_GATE_FLOOR + ud(BURN_GATE_HILL_SHARE).mul(ud(hill)).unwrap();
+        UD60x18 burnRatio = ud(burnAmount).div(ud(burnScale));
+        uint256 rawBurnBoost = ud(BURN_COEFFICIENT).mul((ud(WAD) + burnRatio).ln()).unwrap();
+        return ud(rawBurnBoost).mul(ud(burnGate)).unwrap();
+    }
+
+    function _scaleAmount(uint256 amount, uint256 scaleWad) internal pure returns (uint256) {
+        return amount * scaleWad / WAD;
     }
 
     function _durationMultiplier(uint16 durationDays) internal pure returns (uint256) {
