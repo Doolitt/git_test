@@ -112,7 +112,7 @@ contract EconomicEpochTest is Test {
         assertEq(weightAfter, oldWeight);
         assertEq(manager.totalWeight(), oldTotal);
         assertEq(weightAfter, manager.computeWeightAtEpoch(0, LOCK, 0, DAYS_365));
-        assertGt(weightAfter, manager.computeWeightAtEpoch(1, LOCK, 0, DAYS_365));
+        assertGt(manager.computeWeightAtEpoch(1, LOCK, 0, DAYS_365), weightAfter);
     }
 
     function testTopUpAndExtensionPreserveOriginalEpoch() public {
@@ -122,7 +122,7 @@ contract EconomicEpochTest is Test {
         vm.prank(alice);
         manager.increaseLock(1, 100_000_000 ether);
         assertEq(manager.positionEpoch(1), 0);
-        (,, , uint16 durationAfterTopUp, uint256 weightAfterTopUp) = manager.positions(1);
+        (,,, uint16 durationAfterTopUp, uint256 weightAfterTopUp) = manager.positions(1);
         assertEq(weightAfterTopUp, manager.computeWeightAtEpoch(0, 500_000_000 ether, 0, durationAfterTopUp));
 
         vm.prank(alice);
@@ -204,7 +204,6 @@ contract EconomicEpochTest is Test {
         uint256 minWeight = _weightAtTemporaryEpoch(0.75e18, 50_000_000 ether, 5_000_000 ether);
         assertGt(minWeight, 0);
 
-        // Move from 0.75x to 0.9375x (max 25% step) and validate quote remains finite.
         vm.warp(block.timestamp + 30 days);
         manager.proposeEconomicScale(0.9375e18);
         vm.warp(block.timestamp + 7 days);
