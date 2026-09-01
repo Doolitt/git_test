@@ -1,10 +1,13 @@
 name: FLOWER Foundry CI
 
 on:
+  push:
+    branches:
+      - flower-economic-epochs
   workflow_dispatch:
 
 concurrency:
-  group: flower-foundry-ci
+  group: flower-economic-epochs-ci
   cancel-in-progress: true
 
 permissions:
