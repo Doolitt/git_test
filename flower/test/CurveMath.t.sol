@@ -25,7 +25,7 @@ contract CurveMathTest is Test {
     }
 
     function testFloorGetsOnlyBaseWeight() public view {
-        assertEq(manager.computeWeight(LOCK_50M, 0, DAYS_365), 0.25e18);
+        assertEq(manager.computeWeight(LOCK_50M, 0, DAYS_365), manager.BASE_WEIGHT());
     }
 
     function testDevelopmentCurveIsIncreasing() public view {
